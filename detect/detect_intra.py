@@ -106,7 +106,9 @@ def detect_intra(sentences: list[dict]) -> list[dict]:
 
 def run_detect_intra(
     sentences: list[dict],
-    output_dir: Path | None = None,
+    output_dir: Path,
+    words: list[dict],
+    original_script: str,
 ) -> list[dict]:
     """运行句内重复检测（不写文件，仅返回结果）"""
     

@@ -104,7 +104,10 @@ def _extract_target_indices(detect_results: list[dict], detector_name: str) -> s
     """从检测结果中提取所有涉及的句子 idx（用于圈定上下文范围）"""
     indices: set[int] = set()
     for item in detect_results:
-        for key in ("idx_a", "idx_b", "sentence_idx", "sentence"):
+        for key in (
+            "idx_a", "idx_b", "sentence_idx", "sentence",
+            "sent_a_idx", "sent_b_idx", "sent_idx", "idx",
+        ):
             if key in item and isinstance(item[key], int):
                 indices.add(item[key])
     return indices
@@ -116,7 +119,7 @@ def build_judge_prompt(
     detector_name: str,
     context_radius: int = 2,
 ) -> str:
-    """构建 LLM 研判 Prompt（仅包含目标句 + 上下文，无原稿）"""
+    """构建 LLM 研判 Prompt（包含目标句 + 上下文；策略 6 的 finding 自带原文稿窗口）"""
     
     # 建立 idx → sentence 索引
     idx_map = {s["idx"]: s for s in sentences}
@@ -155,7 +158,10 @@ def build_judge_prompt(
     for i, item in enumerate(detect_results):
         detect_block += f"\n### 检测 #{i}\n"
         for k, v in item.items():
-            if k in ('text_a', 'text_b', 'text', 'text_c'):
+            if k == "org_script_window":
+                # 原文稿对照片段
+                detect_block += f"- **原文稿对照**: {v}\n"
+            elif k in ('text_a', 'text_b', 'text', 'text_c'):
                 text_show = v[:80] + ('...' if len(v) > 80 else '')
                 detect_block += f"- **{k}**: {text_show}\n"
             else:
@@ -173,7 +179,7 @@ def build_judge_prompt(
 ---
 
 请逐条判定上述每条检测。严格按上方格式输出 JSON 数组。"""
-
+    
     return prompt
 
 
@@ -201,12 +207,12 @@ def run_llm_judge(
     
     print(f"   [llm_judge] {detector_name}: 研判 {len(detect_results)} 条检测...")
     
-    # 构建 Prompt（仅目标句+上下文，无原稿）
+    # 构建 Prompt（目标句+上下文；若 finding 含 org_script_window 则自动展示）
     user_prompt = build_judge_prompt(
         detect_results, sentences, detector_name
     )
     system_prompt = PROMPTS.get(detector_name, INTER_JUDGE_PROMPT)
-    
+
     # 调用 LLM
     try:
         response_text = deepseek_chat(
@@ -298,6 +304,7 @@ def run_all_judges(
         sentences:      句子列表
         detect_data:    {detector_name: [findings]} 内存数据（优先使用）；
                         为 None 时 fallback 读磁盘 detect_*.json
+                      （策略 6 的 finding 已内嵌 org_script_window，无需外部传稿）
     """
     all_results = {}
     

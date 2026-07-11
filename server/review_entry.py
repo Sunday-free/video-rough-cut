@@ -14,8 +14,7 @@ from pathlib import Path
 from speech_error_detector.assemble.subtitle_generator import SILENCE_GAP_THRESHOLD
 from speech_error_detector.assemble.assemble import iter_gap_runs
 
-# 项目根目录
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_THIS_DIR = Path(__file__).resolve().parent  # .../speech_error_detector/server
 
 
 # ============================================================
@@ -107,6 +106,24 @@ def _compute_preselect_set(
                 preselect_set.add(i)
                 sil_pre += 1
 
+    # 兜底3: 句尾删词后露出的短静音，也在 full_selected 中，
+    #       不论时长都必须预选。判定方式：gap 紧邻一个已删的非 gap 词。
+    _full = set(full_selected)
+    for idx in full_selected:
+        if idx in preselect_set:
+            continue
+        if idx < 0 or idx >= len(words):
+            continue
+        if not words[idx].get("isGap"):
+            continue
+        left_ok = idx > 0 and not words[idx - 1].get("isGap") and (idx - 1) in _full
+        right_ok = (idx + 1 < len(words)
+                    and not words[idx + 1].get("isGap") and (idx + 1) in _full)
+        if left_ok or right_ok:
+            preselect_set.add(idx)
+            sil_pre += 1
+            skipped -= 1
+
     return sorted(preselect_set), sil_pre, skipped
 
 
@@ -114,7 +131,7 @@ def _generate_review_html(
     words_json: Path, review_auto: Path, video: Path, review_dir: Path,
 ) -> None:
     """调用 generate_review.js 生成 review.html（需要 node）。"""
-    gen_script = _PROJECT_ROOT / "剪口播" / "scripts" / "generate_review.js"
+    gen_script = _THIS_DIR / "generate_review.js"
     if not (gen_script.exists() and shutil.which("node")):
         print("⚠️ 未找到 node 或 generate_review.js，跳过生成 review.html")
         print("   （请手动确保 3_审核/review.html 存在）")

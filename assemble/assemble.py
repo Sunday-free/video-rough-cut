@@ -168,6 +168,7 @@ def run_assemble(
         "sil_body": 0,
         "sil_tail": 0,
         "sil_internal": 0,
+        "sil_after_deleted": 0,
         "filler": 0,
         "total": 0,
     }
@@ -226,6 +227,92 @@ def run_assemble(
                 sel.add(i)
                 stats["sil_internal"] = stats.get("sil_internal", 0) + 1
 
+    # --- 规则补充: 被整句删除的句子，它前后的静音全部删光 ---
+    # 当一句话被整句删除，它和前一句、后一句之间的所有静音（不限于紧邻的）
+    # 都应删除，不留呼吸感。如果中间有多段不连续的静音也全部删除。
+    final_text = {s["idx"]: s.get("text", "") for s in sentences}
+    # 预计算每个句子的 word 区间
+    orig_range_map: dict[int, tuple[int, int]] = {}
+    for os_ in original_sentences:
+        rr = _sentence_range(os_)
+        if rr:
+            orig_range_map[os_["idx"]] = rr
+
+    for s in original_sentences:
+        r = _sentence_range(s)
+        if not r:
+            continue
+        a, b = r
+        # 兼容「整句删除后仍保留空 text 行」：空文本等同于整句删除
+        if final_text.get(s["idx"], "").strip() != "":
+            continue
+
+        # 找到前一个存活的句子
+        prev_end: int | None = None
+        for os_ in original_sentences:
+            if os_["idx"] >= s["idx"]:
+                break
+            if final_text.get(os_["idx"], "").strip() != "":
+                pr = orig_range_map.get(os_["idx"])
+                if pr:
+                    prev_end = pr[1]
+
+        # 找到后一个存活的句子
+        next_start: int | None = None
+        for os_ in reversed(original_sentences):
+            if os_["idx"] <= s["idx"]:
+                break
+            if final_text.get(os_["idx"], "").strip() != "":
+                nr = orig_range_map.get(os_["idx"])
+                if nr:
+                    next_start = nr[0]
+
+        # 删除 [prev_end+1, next_start) 之间的所有静音，
+        # 覆盖句间短停顿、多段不连续静音等。
+        gap_start = (prev_end + 1) if prev_end is not None else 0
+        gap_end = next_start if next_start is not None else len(words)
+        for wi in range(gap_start, gap_end):
+            if words[wi].get("isGap") and wi not in sel:
+                sel.add(wi)
+                stats["sil_after_deleted"] += 1
+
+    # --- 规则补充: 句尾部分删词后露出的静音也删除 ---
+    # 当一句的尾部词被删（keep_head 模式），尾词后的静音会暴露为
+    # 句子间的不自然停顿，应一并删除。
+    for s in original_sentences:
+        r = _sentence_range(s)
+        if not r:
+            continue
+        a, b = r
+
+        # 跳过整句删除的（前面已处理）
+        if final_text.get(s["idx"], "").strip() == "":
+            continue
+
+        # 跳过整句未变的
+        if s.get("text", "") == final_text.get(s["idx"], ""):
+            continue
+
+        # 找到句尾最后一个被删的非 gap 词
+        # 若 b 本身是 gap，往前找到该句实际的最后一个词
+        _tail_idx = b
+        while _tail_idx >= a and words[_tail_idx].get("isGap"):
+            _tail_idx -= 1
+        if _tail_idx < a:
+            continue
+
+        # 尾部词未被删 → 跳过
+        if _tail_idx not in sel:
+            continue
+
+        # 尾部词被删了：删除从 b+1 到下一个句子第一个非 gap 词之间的所有静音
+        gs = b + 1
+        while gs < len(words) and words[gs].get("isGap"):
+            if gs not in sel:
+                sel.add(gs)
+                stats["sil_after_deleted"] += 1
+            gs += 1
+
     # --- 排序 & 写入 ---
     final = sorted(sel)
     stats["total"] = len(final)
@@ -279,7 +366,7 @@ def generate_report_markdown(
     
     md = f"""# 口误分析报告
 
-> 静音阈值：开头/结尾静音必删（不限长度），其余 ≥{silence_thresh}s
+> 静音阈值：开头/结尾静音必删（不限长度），其余 ≥{silence_thresh}s；被整句删除的句子前后所有静音也删（不留呼吸感）。
 
 ## 一、总览
 | 类别 | 删除数 | 说明 |
@@ -288,6 +375,7 @@ def generate_report_markdown(
 | 结尾静音 | {stats['sil_tail']} | 结尾静音必删（不限长度） |
 | 其他静音 ≥{silence_thresh}s | {stats['sil_body']} | {silence_thresh}s 以内保留 |
 | 夹在待删词间的静音 | {stats['sil_internal']} | 两侧说错内容都删时，中间停顿一并删 |
+| 整句删除后的静音 | {stats.get('sil_after_deleted', 0)} | 被整句删除的句子前后所有静音也删 |
 | 语气词（呃/哎） | {stats['filler']} | 明显犹豫；啊/呀保留 |
 | 句间重复 | {judge_counts['inter']} 项 | 被后句完整重说覆盖 |
 | 句内重复 | {judge_counts['intra']} 项 | 精确片段删除 |

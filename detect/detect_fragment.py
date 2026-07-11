@@ -11,7 +11,47 @@ detect_fragment.py — 残句机械检测 + 原稿对齐提示
 
 from pathlib import Path
 
-def detect_fragment(sentences: list[dict]) -> list[dict]:
+from .script_window import build_org_window
+
+
+def _compute_head_word_range(
+    sentence: dict, words: list, head_char_len: int,
+) -> tuple[int, int] | None:
+    """从句子 range 和词表推算 head_text 对应的词索引区间。
+
+    sentence: 含 range (如 "564-585") 的句子 dict
+    words: subtitles_words.json 的词列表（按数组索引对应 wordIdx）
+    head_char_len: head_text 的字符数
+
+    Returns:
+        (start_word_idx, end_word_idx) 或 None（无法计算时）
+    """
+    if not words or not sentence:
+        return None
+    range_str = sentence.get("range", "")
+    if not range_str or "-" not in range_str:
+        return None
+    parts = range_str.split("-")
+    try:
+        start_idx = int(parts[0])
+        end_idx = int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+    char_count = 0
+    word_end = start_idx
+    for i in range(start_idx, min(end_idx + 1, len(words))):
+        w = words[i]
+        if not w.get("isGap"):
+            char_count += len(w.get("text", ""))
+        word_end = i
+        if char_count >= head_char_len:
+            break
+
+    return (start_idx, word_end)
+
+
+def detect_fragment(sentences: list[dict], words: list, original_script: str) -> list[dict]:
     """
     执行残句检测。
     
@@ -83,17 +123,70 @@ def detect_fragment(sentences: list[dict]) -> list[dict]:
                     "decision_hint": "疑似残句/孤立→删整句",
                 })
     
-    # 2. 前句尾与后句头重叠（残句被接续）
+    # 2. 前句尾与后句头重叠（残句被接续重说 / 口吃重说）
+    #    支持三种模式：
+    #    a) 精确尾对齐：a[-L:] == b[:L]  (L>=4，无需停顿)
+    #    b) 近尾对齐：A尾部有多余字符，从A后半段搜索子串匹配B头部
+    #    c) 短重叠(2字) + 句间长停顿(>=0.8s)：口吃重说经典模式
+    #       （原 inter 检测器策略7，统一收归此处，复用 keep_head 部分删除）
+    TAIL_HEAD_K = 2
+    TAIL_HEAD_GAP_MIN = 0.8
     for i in range(len(sentences) - 1):
         a, b = sentences[i]["text"], sentences[i + 1]["text"]
+        if len(a) < 6 or len(b) < 6:
+            continue
+
         overlap = 0
-        # 检查 a 的尾部是否与 b 的头部重叠 (4~8 字符)
+        best_start = len(a)
+        is_stutter = False  # 模式 c 标记
+
+        # 句间停顿（供模式 c 判定）
+        gap_s = None
+        if words:
+            ra = sentences[i].get("range", "")
+            rb = sentences[i + 1].get("range", "")
+            if ra and rb:
+                try:
+                    ra_start, ra_end = map(int, ra.split("-"))
+                    rb_start, rb_end = map(int, rb.split("-"))
+                    if (0 <= ra_end < len(words) and 0 <= rb_start < len(words)):
+                        gap_s = words[rb_start].get("start", 0) - words[ra_end].get("end", 0)
+                except (ValueError, AttributeError):
+                    gap_s = None
+
+        # 模式 a: 精确尾对齐 (a[-L:] == b[:L])
         for L in range(4, min(8, len(a), len(b)) + 1):
             if a[-L:] == b[:L]:
                 overlap = L
-        
-        if overlap >= 4:
-            a_head = a[: len(a) - overlap] if overlap > 0 else a
+                best_start = len(a) - L
+
+        # 模式 b: 非精确对齐，从A后半段搜索子串匹配B头部
+        # 处理A尾部有额外字符的情况（如ASR切句位置不准）
+        if overlap == 0:
+            search_from = max(len(a) // 2, 0)
+            search_to = len(a) - 4
+            for start in range(search_from, search_to + 1):
+                remaining = a[start:]
+                for L in range(min(8, len(remaining), len(b)), 3, -1):
+                    if remaining[:L] == b[:L]:
+                        if L > overlap:
+                            overlap = L
+                            best_start = start
+                        break
+
+        # 模式 c: 短重叠(2字) + 长停顿 → 口吃重说
+        if overlap == 0 and words is not None:
+            if (len(a) >= TAIL_HEAD_K and len(b) >= TAIL_HEAD_K
+                    and a[-TAIL_HEAD_K:] == b[:TAIL_HEAD_K]):
+                if gap_s is not None and gap_s >= TAIL_HEAD_GAP_MIN:
+                    overlap = TAIL_HEAD_K
+                    best_start = len(a) - TAIL_HEAD_K
+                    is_stutter = True
+
+        if overlap >= 2:
+            a_head = a[:best_start]
+            # 推算 head_text 对应的词索引区间（供 LLM judge 精准设置 keep_head）
+            _hw = _compute_head_word_range(sentences[i], words, len(a_head)) if words else None
             # 头部为空 → 整句完整包含于后句，无独有内容，应整句删除
             if len(a_head) == 0:
                 decision_hint = (
@@ -101,14 +194,20 @@ def detect_fragment(sentences: list[dict]) -> list[dict]:
                     f"(重叠{overlap}字), head_text 为空无独有内容, 必须 mode=full 整句删除"
                 )
             else:
+                _hint_extra = ""
+                if _hw:
+                    _hint_extra = f" keep_head 词索引区间: [{_hw[0]}, {_hw[1]}]（请直接使用此区间，不要自行推算）"
                 decision_hint = (
                     f"删前保后→默认保头删尾; 句{sentences[i]['idx']}头部『{a_head}』为独有内容"
                     f"(后句『{b}』不含该内容), 必须 mode=keep_head 保留头部、只删尾部重叠的"
-                    f"『{a[len(a) - overlap:]}』; 仅当头部被后句完整包含时才允许 mode=full 整句删"
+                    f"『{a[best_start:]}』; 仅当头部被后句完整包含时才允许 mode=full 整句删"
+                    f"{_hint_extra}"
                 )
-            findings.append({
+            _subtype = ("句尾句头重叠+长停顿(口吃重说)" if is_stutter
+                        else "残句(被后句接续重说)")
+            _fnd: dict = {
                 "type": "fragment",
-                "subtype": "残句(被后句接续重说)",
+                "subtype": _subtype,
                 "sent_idx": sentences[i]["idx"],
                 "range": sentences[i]["range"],
                 "text": a,
@@ -118,18 +217,34 @@ def detect_fragment(sentences: list[dict]) -> list[dict]:
                 "head_text": a_head,
                 "head_char_len": len(a_head),
                 "decision_hint": decision_hint,
-            })
+            }
+            
+            # 仅模式 c（口吃重说）嵌入原文稿对照片段（供 LLM 交叉验证）
+            if is_stutter:
+                _fnd["gap_seconds"] = round(gap_s, 2) if gap_s is not None else None
+                window = build_org_window(original_script, [
+                    (sentences[i]["idx"], a),
+                    (sentences[i + 1]["idx"], b),
+                ])
+                if window:
+                    _fnd["org_script_window"] = window
+            if _hw:
+                _fnd["head_word_start"] = _hw[0]
+                _fnd["head_word_end"] = _hw[1]
+            findings.append(_fnd)
     
     return findings
 
 
 def run_detect_fragment(
     sentences: list[dict],
-    output_dir: Path | None = None,
+    output_dir: Path,
+    words: list[dict],
+    original_script: str,
 ) -> list[dict]:
     """运行残句检测（不写文件，仅返回结果）"""
     
-    findings = detect_fragment(sentences)
+    findings = detect_fragment(sentences, words=words, original_script=original_script)
     
     print(f"   [detect_fragment] 残句发现: {len(findings)} 处")
     for fnd in findings:

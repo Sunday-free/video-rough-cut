@@ -38,6 +38,8 @@ from speech_error_detector.assemble.subtitle_generator import (
     generate_readable_txt,
     generate_sentences_txt,
 )
+from speech_error_detector.server.review_entry import run_review
+
 
 
 # ============================================================
@@ -233,6 +235,7 @@ def run_pipeline(
     split_mode: str = "silence",
     use_original_script: bool = False,
     loop_version: str = "v1",
+    max_det_rounds: int = 3,
 ) -> dict:
     """
     运行完整的口误检测流水线（编排各步骤子函数）。
@@ -302,6 +305,8 @@ def run_pipeline(
         model=model,
         enable_deepseek_thinking=enable_deepseek_thinking,
         skip_judge=skip_judge,
+        max_det_rounds=max_det_rounds,
+        original_script=original_script,
     )
 
     # ========== 步骤5-7: Agent 循环审查 ==========
@@ -380,7 +385,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # ── 写死的默认参数 ──
-BASE_DIR = str(ROOT / "2026-07-07_红姐")   # 数据根目录（换数据改这一行）
+BASE_DIR = str(ROOT / "2026-07-07_福总")   # 数据根目录（换数据改这一行）
 LOOP_VERSION = "v1"                         # 循环审查模式（v1 默认；v2=专职Agent三分）
 SILENCE_THRESH = 0.9
 # 删除静音时保留的句间呼吸感时长（秒）。
@@ -394,6 +399,9 @@ USE_ORIGINAL_SCRIPT = True     # 启用原稿对照
 SKIP_JUDGE = False
 SKIP_LOOP = True
 SKIP_REVIEW = True
+MAX_DET_ROUNDS = 4
+REVIEW_SERVE = True
+
 
 
 def main() -> None:
@@ -430,15 +438,16 @@ def main() -> None:
         split_mode=SPLIT_MODE,
         use_original_script=USE_ORIGINAL_SCRIPT,
         loop_version=args.loop_version,
+        max_det_rounds=MAX_DET_ROUNDS
     )
 
     # 2) review 默认开启：检测完直接进入审核（autoselect 静音预选 + 0.1s 呼吸感）
     if not SKIP_REVIEW:
-        from speech_error_detector.server.review_entry import run_review
         run_review(
             base_dir=base_dir,
             silence_gap_threshold=SILENCE_THRESH,
             silence_keep_duration=SILENCE_KEEP_DURATION,
+            serve=REVIEW_SERVE,
         )
 
 

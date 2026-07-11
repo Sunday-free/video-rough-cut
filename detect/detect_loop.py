@@ -64,7 +64,7 @@ def _build_delete_indices_from_judge(
     def _is_applied(d: dict) -> bool:
         return d.get("status") != "rejected"
 
-    # 1) inter_repeat: 删除整个句子的所有 word
+    # 1) inter_repeat: 删除整句所有 word
     for d in _load_decisions("inter"):
         if not _is_applied(d):
             continue
@@ -231,7 +231,8 @@ def _dedupe_and_suppress(
     suspect_idxs: set,
 ) -> tuple[dict[str, list], dict[str, list], set, set]:
     """跨轮去重 + 级联抑制：已研判/跳过过的问题不再送 LLM；前轮整句删除造成的新邻接
-    句间重叠（级联）也跳过。
+    句间重叠（级联）也跳过（但「子串完全包含」不跳过：A 整句在 B 中说明 A 本身就是残句，
+    并非级联假象，仅「头部/尾部重叠」可能是前轮删中间句后碰出的假重叠）。
 
     Returns: (filtered, skipped, updated_decided_keys, updated_suspect_idxs)
     """
@@ -244,7 +245,12 @@ def _dedupe_and_suppress(
             if _key in decided_keys:
                 _reason = "已在前轮研判过(去重)"
             elif _cat == "inter" and (_inter_pair(_fnd) & suspect_idxs):
-                _reason = "涉及前轮整句删除后的新邻接句(级联,跳过)"
+                # 「子串完全包含」：A 全部内容在 B 中 → A 本身就是残句，删除中间句
+                # 只暴露了本就存在的问题，不是级联假象。仅头部/尾部重叠才可能是假重叠。
+                if _fnd.get("subtype") == "子串完全包含(前句为残句)":
+                    pass  # 不跳过，继续送研判
+                else:
+                    _reason = "涉及前轮整句删除后的新邻接句(级联,跳过)"
             if _reason:
                 _skipped[_cat].append({"finding": _fnd, "reason": _reason})
             else:
@@ -373,6 +379,7 @@ def _validate_judge_decisions(
 # ============================================================
 #  检测主循环
 # ============================================================
+MAX_DET_ROUNDS = 3
 
 def run_detect_judge_loop(
     *,
@@ -383,6 +390,8 @@ def run_detect_judge_loop(
     model: str,
     enable_deepseek_thinking: bool,
     skip_judge: bool,
+    original_script: str,
+    max_det_rounds: int = MAX_DET_ROUNDS,
 ) -> tuple[list[dict], int, int]:
     """步骤1-4: 机械检测 + LLM 研判 + 应用，多轮循环直到收敛。
 
@@ -392,7 +401,6 @@ def run_detect_judge_loop(
     Returns:
         (机械检测清洗后的句子, 累计候选异常数, 实际运行轮数)
     """
-    MAX_DET_ROUNDS = 3
     cur_sentences = sentences
     accumulated_delete: set[int] = set()
     total_candidates = 0
@@ -438,10 +446,10 @@ def run_detect_judge_loop(
         )
         print(f"  应用完成：删除 {len(_round_delete)} 个 word 索引")
     else:
-        while det_round < MAX_DET_ROUNDS:
+        while det_round < max_det_rounds:
             det_round += 1
             print("-" * 40)
-            print(f"[步骤1-4] 机械检测 + 研判 + 应用 (第 {det_round}/{MAX_DET_ROUNDS} 轮)")
+            print(f"[步骤1-4] 机械检测 + 研判 + 应用 (第 {det_round}/{max_det_rounds} 轮)")
             print("-" * 40)
 
             # 保存当前轮的 sentences（方便查看每轮检测时的输入句子状态）
@@ -455,10 +463,9 @@ def run_detect_judge_loop(
             _detect_sents = [s for s in cur_sentences if s.get("text", "").strip()]
             _findings: dict[str, list] = {}
             with ThreadPoolExecutor(max_workers=3) as _ex:
-                _futs = {
-                    _ex.submit(fn, _detect_sents, analysis_dir): name
-                    for name, fn in _detect_fns.items()
-                }
+                _futs = {}
+                for _name, _fn in _detect_fns.items():
+                    _futs[_ex.submit(_fn, _detect_sents, analysis_dir, words_data, original_script)] = _name
                 for _fut in _futs:
                     _findings[_futs[_fut]] = _fut.result()
             _fi = _findings["inter"]
@@ -521,7 +528,11 @@ def run_detect_judge_loop(
             detect_history.append({
                 "round": det_round,
                 "candidates": {"inter": _fi, "intra": _fint, "fragment": _fra},
-                "judged": _filtered,
+                "judged": {
+                    "inter": _filtered["inter"],
+                    "intra": _filtered["intra"],
+                    "fragment": _filtered["fragment"],
+                },
                 "skipped": _skipped,
                 "delete_indices_count": len(_round_delete),
                 "new_delete_count": len(_new_delete),

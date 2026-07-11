@@ -31,6 +31,10 @@ def detect_inter(sentences: list[dict]) -> list[dict]:
     """
     执行句间重复检测。
     
+    Args:
+        sentences: 句子列表（含 range 字段，如 \"522-536\"）
+        words: 词级时间数据列表（含 start/end 时间戳），用于计算句间间隔
+    
     Returns:
         findings: 检测结果列表
     """
@@ -177,12 +181,38 @@ def detect_inter(sentences: list[dict]) -> list[dict]:
         if hit:
             continue
 
+    # 去重：同一句子对可能被多个策略命中（如"相邻句头重复"+"子串完全包含"），
+    # 保留最具体的 subtype，去除冗余。
+    _PRIORITY = {
+        "子串完全包含(前句为残句)": 5,
+        "非前缀子串重叠": 4,
+        "尾部重叠(前句为残次近重复)": 3,
+        "相邻句头重复": 2,
+        "隔句重复(中间短残句)": 1,
+    }
+    seen: dict[tuple, tuple[int, int | None]] = {}  # key -> (priority, deduped_index)
+    deduped: list[dict | None] = []
+    for i, f in enumerate(findings):
+        pair_idx = f.get("sent_b_idx", f.get("sent_c_idx", -1))
+        key = (f["sent_a_idx"], pair_idx)
+        p = _PRIORITY.get(f["subtype"], 0)
+        if key not in seen or p > seen[key][0]:
+            if key in seen:
+                deduped[seen[key][1]] = None  # 标记旧项待移除
+            seen[key] = (p, len(deduped))
+            deduped.append(f)
+        # lower priority, skip
+
+    findings = [f for f in deduped if f is not None]
+
     return findings
 
 
 def run_detect_inter(
     sentences: list[dict],
-    output_dir: Path | None = None,
+    output_dir: Path,
+    words: list[dict],
+    original_script: str,
 ) -> list[dict]:
     """运行句间重复检测（不写文件，仅返回结果）"""
     

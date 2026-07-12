@@ -10,10 +10,14 @@ detect_inter.py — 句间重复机械检测
 
 from pathlib import Path
 
+from . import CN_DIGIT_MAP, normalize_numerals
+
+
 def head_eq(a: str, b: str, n: int = 5) -> int:
-    """计算两字符串的共同前缀长度（最多 n 字符）"""
+    """计算两字符串的共同前缀长度（最多 n 字符），归一化数字后比较。"""
+    na, nb = normalize_numerals(a), normalize_numerals(b)
     k = 0
-    while k < n and k < len(a) and k < len(b) and a[k] == b[k]:
+    while k < n and k < len(na) and k < len(nb) and na[k] == nb[k]:
         k += 1
     return k
 
@@ -23,8 +27,8 @@ _FILLERS = set("呢呃啊呀嘛吧嗯哦呐哈嘞哟喂啦咯")
 
 
 def _norm(t: str) -> str:
-    """去掉语气衬字后的规范化文本（用于近重复匹配）。"""
-    return "".join(ch for ch in t if ch not in _FILLERS)
+    """去掉语气衬字 + 统一数字后的规范化文本（用于近重复匹配）。"""
+    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in _FILLERS)
 
 
 def detect_inter(sentences: list[dict]) -> list[dict]:
@@ -87,19 +91,19 @@ def detect_inter(sentences: list[dict]) -> list[dict]:
     #    例: 句A="我一直记到现在..." 句B="...也把我镇住了我一直记到现在..."
     #    前缀没对上但句B包了句A的大部分 → 句A是前序不完整版本
     for i in range(len(sentences) - 1):
-        a_text = sentences[i]["text"]
-        b_text = sentences[i + 1]["text"]
-        if len(a_text) < 8 or len(b_text) < 12:
+        a_text, b_text = sentences[i]["text"], sentences[i + 1]["text"]
+        na, nb = _norm(a_text), _norm(b_text)
+        if len(na) < 8 or len(nb) < 12:
             continue
         
         # 用滑动窗口检测：从 A 的多个偏移位置取子串，检查是否在 B 中
         max_overlap = 0
-        for start in range(1, min(len(a_text) - 8, 12)):
+        for start in range(1, min(len(na) - 8, 12)):
             # 从 start 开始取最长子串在 B 中匹配
-            remaining = a_text[start:]
+            remaining = na[start:]
             for win_len in range(min(len(remaining), 30), 7, -1):
                 sub = remaining[:win_len]
-                if sub in b_text:
+                if sub in nb:
                     max_overlap = max(max_overlap, win_len)
                     break
         

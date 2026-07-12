@@ -246,9 +246,13 @@ def _dedupe_and_suppress(
                 _reason = "已在前轮研判过(去重)"
             elif _cat == "inter" and (_inter_pair(_fnd) & suspect_idxs):
                 # 「子串完全包含」：A 全部内容在 B 中 → A 本身就是残句，删除中间句
-                # 只暴露了本就存在的问题，不是级联假象。仅头部/尾部重叠才可能是假重叠。
-                if _fnd.get("subtype") == "子串完全包含(前句为残句)":
+                # 只暴露了本就存在的问题，不是级联假象。
+                # 「相邻句头重复 ≥ 5 字」：共同前缀越长，越不可能是级联碰出的假重叠。
+                subtype = _fnd.get("subtype", "")
+                if subtype == "子串完全包含(前句为残句)":
                     pass  # 不跳过，继续送研判
+                elif subtype == "相邻句头重复" and _fnd.get("common_prefix_len", 0) >= 5:
+                    pass  # 5 字以上头部重叠不可能由级联碰出
                 else:
                     _reason = "涉及前轮整句删除后的新邻接句(级联,跳过)"
             if _reason:

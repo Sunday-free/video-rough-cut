@@ -385,8 +385,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # ── 写死的默认参数 ──
-BASE_DIR = str(ROOT / "2026-07-07_福总")   # 数据根目录（换数据改这一行）
-LOOP_VERSION = "v1"                         # 循环审查模式（v1 默认；v2=专职Agent三分）
+BASE_DIR = str(ROOT / "2026-07-07_红姐")   # 数据根目录（换数据改这一行）
+LOOP_VERSION = "v2"                         # 循环审查模式（v1 默认；v2=专职Agent三分）
 SILENCE_THRESH = 0.9
 # 删除静音时保留的句间呼吸感时长（秒）。
 SILENCE_KEEP_DURATION = 0.5

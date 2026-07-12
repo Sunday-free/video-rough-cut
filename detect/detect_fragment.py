@@ -12,6 +12,7 @@ detect_fragment.py — 残句机械检测 + 原稿对齐提示
 from pathlib import Path
 
 from .script_window import build_org_window
+from . import normalize_numerals
 
 
 def _compute_head_word_range(
@@ -51,7 +52,7 @@ def _compute_head_word_range(
     return (start_idx, word_end)
 
 
-def detect_fragment(sentences: list[dict], words: list, original_script: str) -> list[dict]:
+def detect_fragment(sentences: list[dict], words: list | None = None, original_script: str = "") -> list[dict]:
     """
     执行残句检测。
     
@@ -135,6 +136,8 @@ def detect_fragment(sentences: list[dict], words: list, original_script: str) ->
         a, b = sentences[i]["text"], sentences[i + 1]["text"]
         if len(a) < 6 or len(b) < 6:
             continue
+        # 归一化文本（数字统一为阿拉伯数字）用于字面比较
+        na, nb = normalize_numerals(a), normalize_numerals(b)
 
         overlap = 0
         best_start = len(a)
@@ -155,20 +158,20 @@ def detect_fragment(sentences: list[dict], words: list, original_script: str) ->
                     gap_s = None
 
         # 模式 a: 精确尾对齐 (a[-L:] == b[:L])
-        for L in range(4, min(8, len(a), len(b)) + 1):
-            if a[-L:] == b[:L]:
+        for L in range(4, min(8, len(na), len(nb)) + 1):
+            if na[-L:] == nb[:L]:
                 overlap = L
                 best_start = len(a) - L
 
         # 模式 b: 非精确对齐，从A后半段搜索子串匹配B头部
         # 处理A尾部有额外字符的情况（如ASR切句位置不准）
         if overlap == 0:
-            search_from = max(len(a) // 2, 0)
-            search_to = len(a) - 4
+            search_from = max(len(na) // 2, 0)
+            search_to = len(na) - 4
             for start in range(search_from, search_to + 1):
-                remaining = a[start:]
-                for L in range(min(8, len(remaining), len(b)), 3, -1):
-                    if remaining[:L] == b[:L]:
+                remaining = na[start:]
+                for L in range(min(8, len(remaining), len(nb)), 3, -1):
+                    if remaining[:L] == nb[:L]:
                         if L > overlap:
                             overlap = L
                             best_start = start
@@ -176,8 +179,8 @@ def detect_fragment(sentences: list[dict], words: list, original_script: str) ->
 
         # 模式 c: 短重叠(2字) + 长停顿 → 口吃重说
         if overlap == 0 and words is not None:
-            if (len(a) >= TAIL_HEAD_K and len(b) >= TAIL_HEAD_K
-                    and a[-TAIL_HEAD_K:] == b[:TAIL_HEAD_K]):
+            if (len(na) >= TAIL_HEAD_K and len(nb) >= TAIL_HEAD_K
+                    and na[-TAIL_HEAD_K:] == nb[:TAIL_HEAD_K]):
                 if gap_s is not None and gap_s >= TAIL_HEAD_GAP_MIN:
                     overlap = TAIL_HEAD_K
                     best_start = len(a) - TAIL_HEAD_K

@@ -190,6 +190,7 @@ def run_llm_judge(
     detector_name: str,
     model: str = "deepseek-v4-pro",
     enable_thinking: bool | None = None,
+    round_idx: int | None = None,
 ) -> tuple[Path, list]:
     """
     运行 LLM 研判并保存为合并格式（detect + decision 嵌套，对齐 review_loop_decisions.json）。
@@ -212,6 +213,16 @@ def run_llm_judge(
         detect_results, sentences, detector_name
     )
     system_prompt = PROMPTS.get(detector_name, INTER_JUDGE_PROMPT)
+
+    # 落盘：每次研判的 user prompt 写到 detect 文件夹，便于核查（区分 round）
+    _round_tag = f"_round{round_idx}" if round_idx is not None else ""
+    prompt_path = output_dir / f"judge_prompt_{detector_name}{_round_tag}.txt"
+    try:
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(user_prompt)
+        print(f"      📝 user prompt 已写入: {prompt_path.name}")
+    except Exception as e:
+        print(f"      ⚠️ user prompt 写入失败: {e}")
 
     # 调用 LLM
     try:
@@ -295,6 +306,7 @@ def run_all_judges(
     detect_data: dict[str, list[dict]] | None = None,
     model: str = "deepseek-v4-pro",
     enable_thinking: bool | None = None,
+    round_idx: int | None = None,
 ) -> dict[str, tuple[Path, list]]:
     """
     对所有三个检测器运行 LLM 研判。
@@ -332,6 +344,7 @@ def run_all_judges(
             detector_name=det_name,
             model=model,
             enable_thinking=enable_thinking,
+            round_idx=round_idx,
         )
         all_results[det_name] = result
     

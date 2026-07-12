@@ -115,7 +115,7 @@ def _build_delete_indices_from_judge(
                     boundary = a + boundary
                 for wi in range(boundary + 1, b + 1):
                     delete_indices.add(wi)
-
+   
     return delete_indices
 
 
@@ -253,6 +253,8 @@ def _dedupe_and_suppress(
                     pass  # 不跳过，继续送研判
                 elif subtype == "相邻句头重复" and _fnd.get("common_prefix_len", 0) >= 5:
                     pass  # 5 字以上头部重叠不可能由级联碰出
+                elif subtype.startswith("跨句"):
+                    pass  # 跨句策略跳过≥2 句，不是级联假象
                 else:
                     _reason = "涉及前轮整句删除后的新邻接句(级联,跳过)"
             if _reason:
@@ -495,6 +497,7 @@ def run_detect_judge_loop(
                 detect_data=_filtered,
                 model=model,
                 enable_thinking=enable_deepseek_thinking,
+                round_idx=det_round,
             )
             print(f"  研判完成，共 {len(judge_results)} 种检测器")
 

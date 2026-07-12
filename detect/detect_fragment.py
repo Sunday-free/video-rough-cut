@@ -11,8 +11,13 @@ detect_fragment.py — 残句机械检测 + 原稿对齐提示
 
 from pathlib import Path
 
-from .script_window import build_org_window
-from . import normalize_numerals
+from .script_window import build_org_window, build_short_org_window
+from . import CN_DIGIT_MAP, normalize_numerals
+from .detect_inter import _FILLERS
+
+def _norm_frag(t: str) -> str:
+    """去掉语气衬字 + 统一数字后的规范化文本（用于头体重叠匹配）。"""
+    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in _FILLERS)
 
 
 def _compute_head_word_range(
@@ -50,6 +55,17 @@ def _compute_head_word_range(
             break
 
     return (start_idx, word_end)
+
+
+def _norm_pos_to_orig_pos(norm_pos: int, original: str) -> int:
+    """将规范化文本（_norm_frag 后）中的字符位置映射回原始文本位置（跳过语气衬字）。"""
+    norm_idx = 0
+    for orig_idx, ch in enumerate(original):
+        if ch not in _FILLERS:
+            if norm_idx >= norm_pos:
+                return orig_idx
+            norm_idx += 1
+    return len(original)
 
 
 def detect_fragment(sentences: list[dict], words: list | None = None, original_script: str = "") -> list[dict]:
@@ -106,23 +122,31 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
                 # 检查是否为有序列中的合法序号
                 if _is_ordinal_sequence(sent["idx"]):
                     continue  # 是合法序号，跳过
-                findings.append({
+                _f = {
                     "type": "fragment",
                     "subtype": "孤立编号",
                     "sent_idx": sent["idx"],
                     "range": sent["range"],
                     "text": t,
                     "decision_hint": "孤立编号(如'三')→删整句, 内容在后续句",
-                })
+                }
+                _window = build_short_org_window(original_script, sentences, sent["idx"])
+                if _window:
+                    _f["org_script_window"] = _window
+                findings.append(_f)
             else:
-                findings.append({
+                _f = {
                     "type": "fragment",
                     "subtype": "极短孤立句",
                     "sent_idx": sent["idx"],
                     "range": sent["range"],
                     "text": t,
                     "decision_hint": "疑似残句/孤立→删整句",
-                })
+                }
+                _window = build_short_org_window(original_script, sentences, sent["idx"])
+                if _window:
+                    _f["org_script_window"] = _window
+                findings.append(_f)
     
     # 2. 前句尾与后句头重叠（残句被接续重说 / 口吃重说）
     #    支持三种模式：
@@ -228,14 +252,189 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
                 window = build_org_window(original_script, [
                     (sentences[i]["idx"], a),
                     (sentences[i + 1]["idx"], b),
-                ])
+                ], n_sentences=len(sentences))
                 if window:
                     _fnd["org_script_window"] = window
             if _hw:
                 _fnd["head_word_start"] = _hw[0]
                 _fnd["head_word_end"] = _hw[1]
             findings.append(_fnd)
-    
+
+    # 4. 前句尾与后句头重叠（头体[尾]重叠，跨 ≤2 句）
+    #    前句 A 的【尾部】与后句 B 的头部重叠（B 重说了 A 尾部的意思）→ 保头删尾（keep_head）：
+    #    重叠应删「前面的」——删 A 的冗余尾部、保留 A 独有头部；后句 B 完整保留不动。
+    #    区别于 inter 的「头-头」(B 头部 == A 头部，删前保后整句删 A)。本策略是 A 尾部 == B 头部。
+    #    例: A="那会呢我还没有完全地琢磨明白但是呢这句话可是给我镇住了啊"
+    #        B="但是这句话那可是把我镇住了我一直记到现在"
+    #        → A 保头删尾：保留"那会呢我还没有完全地琢磨明白"、删尾部"但是呢这句话可是给我镇住了啊"；
+    #          B 完整保留"但是这句话那可是把我镇住了我一直记到现在"。
+    _HEAD_MIN = 5
+    _GAP_MAX = 3
+    _TAIL_RATIO = 0.5  # B 头部须落在 A 后 50% 才算"尾部"重叠，避免匹配到 A 中部
+
+    def _longest_head_in_tail(b_norm: str, a_norm: str) -> tuple[int, int]:
+        """返回 (best_len, best_pos)：从 B 头部起、作为连续子串落在 A 尾部的最长匹配长度及位置。
+        best_pos 用于回推原文中重叠的起始点。"""
+        target = b_norm[:_HEAD_MIN]
+        if target not in a_norm:
+            return (0, -1)
+        tail_start = int(len(a_norm) * _TAIL_RATIO)
+        best_len = 0
+        best_pos = -1
+        start = 0
+        while True:
+            pos = a_norm.find(target, start)
+            if pos == -1:
+                break
+            # 头部对齐（pos==0）属 inter 头-头，本策略跳过
+            if pos == 0:
+                start = pos + 1
+                continue
+            # 须落在 A 尾部区域（≥ 后 TAIL_RATIO），否则不算"头体重叠"
+            if pos < tail_start:
+                start = pos + 1
+                continue
+            L = _HEAD_MIN
+            while (pos + L < len(a_norm) and L < len(b_norm)
+                   and a_norm[pos + L] == b_norm[L]):
+                L += 1
+            if L > best_len:
+                best_len = L
+                best_pos = pos
+            start = pos + 1
+        return (best_len, best_pos)
+
+    for j in range(1, len(sentences)):
+        b = sentences[j]["text"]
+        if len(b) < _HEAD_MIN + 1:  # 至少需 head + 1 个独有尾部字符
+            continue
+        nb = _norm_frag(b)
+        for offset in range(1, min(j, _GAP_MAX) + 1):
+            i = j - offset
+            a = sentences[i]["text"]
+            if len(a) < _HEAD_MIN:
+                continue
+            na = _norm_frag(a)
+            match_len, pos = _longest_head_in_tail(nb, na)
+            if match_len >= _HEAD_MIN and pos > 0:
+                # 重叠在 A 尾部从 pos 起到 A 结尾 → 整段冗余，删 A 尾部、保 A 头部
+                split_orig = _norm_pos_to_orig_pos(pos, a)
+                a_head = a[:split_orig]
+                a_tail = a[split_orig:]
+                if len(a_head) > 0 and len(a_tail) > 0:
+                    # 推算保留头部对应的词索引区间（供 LLM keep_head 精准设置）
+                    _hw = _compute_head_word_range(sentences[i], words, len(a_head)) if words else None
+                    _hint_extra = ""
+                    if _hw:
+                        _hint_extra = (
+                            f" 保头词区间(可直接用): [{_hw[0]}, {_hw[1]}]"
+                            f"（保留『{a_head}』，删除尾部『{a_tail}』）"
+                        )
+                    decision_hint = (
+                        f"保头删尾(keep_head)→前句{sentences[i]['idx']}尾部『{a_tail}』"
+                        f"与后句{sentences[j]['idx']}头部重叠({match_len}字)，"
+                        f"重叠应删前面的，故需 mode=keep_head 保留前句独有头部『{a_head}』、"
+                        f"删除冗余尾部『{a_tail}』；后句{sentences[j]['idx']}完整保留"
+                        f"{_hint_extra}"
+                    )
+                    _fnd: dict = {
+                        "type": "fragment",
+                        "subtype": f"前句尾与后句头重叠(头体重叠,跳过{offset}句)",
+                        "sent_idx": sentences[i]["idx"],
+                        "range": sentences[i]["range"],
+                        "text": a,
+                        "next_sent_idx": sentences[j]["idx"],
+                        "next_sent_text": b,
+                        "overlap_len": match_len,
+                        "head_text": a_head,
+                        "head_char_len": len(a_head),
+                        "tail_text": a_tail,
+                        "decision_hint": decision_hint,
+                    }
+                    if _hw:
+                        _fnd["head_word_start"] = _hw[0]
+                        _fnd["head_word_end"] = _hw[1]
+                    findings.append(_fnd)
+                    break
+
+    # 5. 跨句头-头口误重说（隔1-2句，去语气词后头部 ≥5 字匹配）
+    #    前句 A 头部与后句 B 头部相同 → A 为口误版本，应整句删除(mode=full)
+    #    例: 34="后来呢他给我呃在复盘以前做的对照实验"
+    #        36="后来呢他给我复盘以前做的对照实验我亲眼看见"
+    #        → 34 头-头匹配 5 字，口误重说，整句删 34
+    _HEAD_HH_MIN = 5
+    _CROSS_GAP_MAX = 3
+    for j in range(2, len(sentences)):
+        b_text = sentences[j]["text"]
+        if len(b_text) < _HEAD_HH_MIN:
+            continue
+        nb = _norm_frag(b_text)
+        for gap in range(2, min(j, _CROSS_GAP_MAX) + 1):
+            i = j - gap
+            a_text = sentences[i]["text"]
+            if len(a_text) < _HEAD_HH_MIN:
+                continue
+            na = _norm_frag(a_text)
+            k = 0
+            while k < min(len(na), len(nb)) and na[k] == nb[k]:
+                k += 1
+            if k >= _HEAD_HH_MIN:
+                findings.append({
+                    "type": "fragment",
+                    "subtype": f"跨句头-头口误重说(跳过{gap-1}句)",
+                    "sent_idx": sentences[i]["idx"],
+                    "range": sentences[i]["range"],
+                    "text": a_text,
+                    "next_sent_idx": sentences[j]["idx"],
+                    "next_sent_text": b_text,
+                    "overlap_len": k,
+                    "head_text": "",
+                    "head_char_len": 0,
+                    "decision_hint": (
+                        f"删前保后(mode=full)→句{sentences[i]['idx']}头部与句{sentences[j]['idx']}"
+                        f"头部{k}字相同(去语气词,跳过{gap-1}句)，前句为口误版本，"
+                        f"后句已重说并补全，应整句删除句{sentences[i]['idx']}"
+                    ),
+                })
+                break
+
+    # 6. 跨句尾部重叠（隔1-2句，去语气词后尾部 ≥4 字匹配）
+    #    前句 A 尾部与后句 B 尾部相同 → A 为残次版本，应整句删除(mode=full)
+    #    例: 33="我呢一直是记到现在" 35="...把我镇住了我一直记到现在"
+    #        → 33 尾部 4 字与 35 尾部相同，残次版本，整句删 33
+    _TAIL_OVERLAP_MIN = 4
+    for j in range(2, len(sentences)):
+        b_text = sentences[j]["text"]
+        nb = _norm_frag(b_text)
+        if len(nb) < _TAIL_OVERLAP_MIN:
+            continue
+        for gap in range(2, min(j, _CROSS_GAP_MAX) + 1):
+            i = j - gap
+            a_text = sentences[i]["text"]
+            na = _norm_frag(a_text)
+            if len(na) < _TAIL_OVERLAP_MIN or len(na) >= len(nb):
+                continue
+            k = min(_TAIL_OVERLAP_MIN, len(na), len(nb))
+            if na[-k:] == nb[-k:]:
+                findings.append({
+                    "type": "fragment",
+                    "subtype": f"跨句尾部重叠(跳过{gap-1}句)",
+                    "sent_idx": sentences[i]["idx"],
+                    "range": sentences[i]["range"],
+                    "text": a_text,
+                    "next_sent_idx": sentences[j]["idx"],
+                    "next_sent_text": b_text,
+                    "overlap_len": k,
+                    "head_text": "",
+                    "head_char_len": 0,
+                    "decision_hint": (
+                        f"删前保后(mode=full)→句{sentences[i]['idx']}尾部与句{sentences[j]['idx']}"
+                        f"尾部重叠{k}字(去语气词,跳过{gap-1}句)，前句为残次版本，"
+                        f"应整句删除句{sentences[i]['idx']}"
+                    ),
+                })
+                break
+
     return findings
 
 

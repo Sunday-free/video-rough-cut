@@ -11,6 +11,7 @@ detect_inter.py — 句间重复机械检测
 from pathlib import Path
 
 from . import CN_DIGIT_MAP, normalize_numerals
+from ..base.fillers import MODAL_CHARS
 
 
 def head_eq(a: str, b: str, n: int = 5) -> int:
@@ -22,21 +23,14 @@ def head_eq(a: str, b: str, n: int = 5) -> int:
     return k
 
 
-# 常见语气/停顿衬字：做"近重复"判定时忽略，避免 呢/呃 等差导致漏检
-# 分类：
-#   叹词/迟疑声：额 唔 哎 唉 诶 嗨 嗐 咦 噢 喔 嗷 吖 嗳
-#   句末语气词：呗 撒 噻 咧 啰 喽 哇 吔
-_FILLERS = set("呢呃啊呀嘛吧嗯哦呐哈嘞哟喂啦咯"
-               "额唔哎唉诶嗨嗐咦噢喔嗷吖嗳"
-               "呗撒噻咧啰喽哇吔")
-
-
+# 常见语气/停顿衬字：做"近重复"判定时忽略，避免 呢/呃 等差导致漏检。
+# MODAL_CHARS 为全工程统一的最全语气词集（见 base/fillers.py），不再本地定义。
 def _norm(t: str) -> str:
     """去掉语气衬字 + 统一数字后的规范化文本（用于近重复匹配）。"""
-    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in _FILLERS)
+    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in MODAL_CHARS)
 
 
-def detect_inter(sentences: list[dict]) -> list[dict]:
+def detect_inter(sentences: list[dict], original_script: str = "") -> list[dict]:
     """
     执行句间重复检测。
     
@@ -225,7 +219,7 @@ def run_detect_inter(
 ) -> list[dict]:
     """运行句间重复检测（不写文件，仅返回结果）"""
     
-    findings = detect_inter(sentences)
+    findings = detect_inter(sentences, original_script)
     
     print(f"   [detect_inter] 句间重复发现: {len(findings)} 处")
     for fnd in findings:

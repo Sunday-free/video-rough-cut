@@ -5,7 +5,7 @@ speech_error_detector — 口误检测系统
 - pipeline.py:            主入口，串联检测→研判→循环审查→装配→字幕（保留在包根，供 run_koubo.py / SKILL.md 直接引用）
 - base/:                  基础依赖（句子 IO、路径配置、音频提取、转录）
     sentence_io.py          sentences.txt 读写
-    paths.py                输出目录配置（detect_dir/loop_dir/debug_dir；judge 产物并入 detect/）
+    paths.py                输出目录配置（detect_dir/loop_dir；judge 产物并入 detect/）
     audio_extractor.py      音频提取
     volcengine_transcriber.py  火山引擎转录
 - detect/:                机械检测 + LLM 研判

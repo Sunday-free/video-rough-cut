@@ -8,12 +8,7 @@ detect_intra.py — 句内重复机械检测
 
 from pathlib import Path
 
-
-# 语气词/叹词集合：纯由这些字组成的子串重复（如"啊啊""呢呢""呃呃"）属于自然语流，
-# 不算口误，机械检测阶段直接跳过。
-MODAL_CHARS = set(
-    "啊呢吧嘛呀哇呐嘞咯哦呃嗯啦哈哟昂咦喂哼嗬嘘咂噻呗啧喏呸咦哟嗷嘢"
-)
+from ..base.fillers import MODAL_CHARS
 
 # 自然叠词 / 并列重复的连接性虚词：两个重复单元之间仅隔这些字（1~3 个）时，
 # 视为汉语正常的并列强调（如"一波还有一波""一个又一个""一遍又一遍"），不算口误。
@@ -54,7 +49,7 @@ def _is_natural_reduplication(txt: str, sub: str, pos1: int, pos2: int) -> bool:
     return False
 
 
-def detect_intra(sentences: list[dict]) -> list[dict]:
+def detect_intra(sentences: list[dict], original_script: str = "") -> list[dict]:
     """
     执行句内重复检测。
     
@@ -112,7 +107,7 @@ def run_detect_intra(
 ) -> list[dict]:
     """运行句内重复检测（不写文件，仅返回结果）"""
     
-    findings = detect_intra(sentences)
+    findings = detect_intra(sentences, original_script)
     
     print(f"   [detect_intra] 句内重复发现: {len(findings)} 句")
     for fnd in findings:

@@ -11,13 +11,12 @@ detect_fragment.py — 残句机械检测 + 原稿对齐提示
 
 from pathlib import Path
 
-from .script_window import build_org_window, build_short_org_window
 from . import CN_DIGIT_MAP, normalize_numerals
-from .detect_inter import _FILLERS
+from ..base.fillers import MODAL_CHARS
 
 def _norm_frag(t: str) -> str:
     """去掉语气衬字 + 统一数字后的规范化文本（用于头体重叠匹配）。"""
-    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in _FILLERS)
+    return "".join(CN_DIGIT_MAP.get(ch, ch) for ch in t if ch not in MODAL_CHARS)
 
 
 def _compute_head_word_range(
@@ -61,7 +60,7 @@ def _norm_pos_to_orig_pos(norm_pos: int, original: str) -> int:
     """将规范化文本（_norm_frag 后）中的字符位置映射回原始文本位置（跳过语气衬字）。"""
     norm_idx = 0
     for orig_idx, ch in enumerate(original):
-        if ch not in _FILLERS:
+        if ch not in MODAL_CHARS:
             if norm_idx >= norm_pos:
                 return orig_idx
             norm_idx += 1
@@ -117,6 +116,9 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
     # 1. 极短句检测 (孤立编号 / 极短孤立)
     for sent in sentences:
         t = sent["text"]
+        # 纯语气词短句（如"啊""嗯""哦"）属自然语流填充，非残句，跳过
+        if t and all(ch in MODAL_CHARS for ch in t):
+            continue
         if len(t) <= 2:
             if t in numbers:
                 # 检查是否为有序列中的合法序号
@@ -130,9 +132,6 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
                     "text": t,
                     "decision_hint": "孤立编号(如'三')→删整句, 内容在后续句",
                 }
-                _window = build_short_org_window(original_script, sentences, sent["idx"])
-                if _window:
-                    _f["org_script_window"] = _window
                 findings.append(_f)
             else:
                 _f = {
@@ -143,9 +142,6 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
                     "text": t,
                     "decision_hint": "疑似残句/孤立→删整句",
                 }
-                _window = build_short_org_window(original_script, sentences, sent["idx"])
-                if _window:
-                    _f["org_script_window"] = _window
                 findings.append(_f)
     
     # 2. 前句尾与后句头重叠（残句被接续重说 / 口吃重说）
@@ -246,15 +242,8 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
                 "decision_hint": decision_hint,
             }
             
-            # 仅模式 c（口吃重说）嵌入原文稿对照片段（供 LLM 交叉验证）
             if is_stutter:
                 _fnd["gap_seconds"] = round(gap_s, 2) if gap_s is not None else None
-                window = build_org_window(original_script, [
-                    (sentences[i]["idx"], a),
-                    (sentences[i + 1]["idx"], b),
-                ], n_sentences=len(sentences))
-                if window:
-                    _fnd["org_script_window"] = window
             if _hw:
                 _fnd["head_word_start"] = _hw[0]
                 _fnd["head_word_end"] = _hw[1]
@@ -363,7 +352,7 @@ def detect_fragment(sentences: list[dict], words: list | None = None, original_s
     #        36="后来呢他给我复盘以前做的对照实验我亲眼看见"
     #        → 34 头-头匹配 5 字，口误重说，整句删 34
     _HEAD_HH_MIN = 5
-    _CROSS_GAP_MAX = 3
+    _CROSS_GAP_MAX = 4
     for j in range(2, len(sentences)):
         b_text = sentences[j]["text"]
         if len(b_text) < _HEAD_HH_MIN:

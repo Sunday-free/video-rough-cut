@@ -58,6 +58,7 @@ def get_api_key() -> str:
 def transcribe(
     audio_path: Path,
     output_dir: Path,
+    language: str = "zh-CN",
 ) -> tuple[Path, dict]:
     """
     调用火山引擎录音文件识别 2.0（Seed ASR v3 异步模式）。
@@ -65,6 +66,8 @@ def transcribe(
     Args:
         audio_path: 音频文件路径 (mp3/wav/m4a/aac)
         output_dir: 输出目录
+        language: 识别语言，默认 "zh-CN"（如粤语 "zh-CN" 也走普通话模型，
+                  火山不支持粤语专线时可保持默认；如有粤语模型 endpoint 在此切换）
     
     Returns:
         (result_json_path, meta_dict)
@@ -109,7 +112,7 @@ def transcribe(
             "rate": 16000,
             "bits": 16,
             "channel": 1,
-            "language": "zh-CN",
+            "language": language,
         },
         "request": {
             "model_name": "bigmodel",
@@ -193,6 +196,7 @@ def transcribe(
                 "provider": "volcengine",
                 "api": "api/v3/auc/bigmodel",
                 "model": "Seed ASR 2.0",
+                "language": language,
                 "resource_id": VOLCENGINE_RESOURCE_ID,
                 "request_id": request_id,
                 "attempts": attempt,

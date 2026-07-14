@@ -127,8 +127,124 @@ def _compute_preselect_set(
     return sorted(preselect_set), sil_pre, skipped
 
 
+def _parse_range(s) -> tuple[int, int] | None:
+    """把 "a-b" 形式的字级 range 字符串解析成 (a, b)。"""
+    try:
+        a, b = str(s).split("-")
+        return int(a), int(b)
+    except Exception:
+        return None
+
+
+def _entry_indices(entry: dict) -> tuple[str | None, list[tuple[int, int]]]:
+    """从一条决策条目提取 (类型, 受影响的字级索引区间列表)。
+
+    - inter_repeat: 删前句 → 用 sent_a_range（回退 range）。
+    - intra_repeat: 只删精确片段 → 优先 decision.delete_ranges；回退整句 range。
+    - fragment:     mode=keep_head → 删尾部(keep_head 末+1 .. range 末)；
+                    mode=full/其它 → 整句 range。
+    """
+    det = entry.get("detect", entry) or {}
+    dec = entry.get("decision", {}) or {}
+    typ = det.get("type") or det.get("dimension")
+
+    if typ == "intra_repeat":
+        dr = dec.get("delete_ranges")
+        out: list[tuple[int, int]] = []
+        if isinstance(dr, list):
+            for pr in dr:
+                if isinstance(pr, (list, tuple)) and len(pr) == 2:
+                    try:
+                        out.append((int(pr[0]), int(pr[1])))
+                    except Exception:
+                        pass
+        if out:
+            return typ, out
+        r = _parse_range(det.get("range"))
+        return typ, ([r] if r else [])
+
+    if typ == "fragment":
+        r = _parse_range(det.get("range"))
+        if dec.get("mode") == "keep_head" and dec.get("keep_head") and r:
+            kh = dec["keep_head"]
+            try:
+                return typ, [(int(kh[1]) + 1, r[1])]
+            except Exception:
+                return typ, [r]
+        return typ, ([r] if r else [])
+
+    if typ == "inter_repeat":
+        r = _parse_range(det.get("sent_a_range")) or _parse_range(det.get("range"))
+        return typ, ([r] if r else [])
+
+    return typ, []
+
+
+def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
+    """构建 {字级索引: 类型} 映射，类型取值 inter_repeat/intra_repeat/fragment。
+
+    数据来源（权威、已应用的决策）：
+      - detect/judge_decisions_{inter,intra,fragment}.json（status == "applied"）
+      - review_loop_decisions.json（decision.confirmed == True）
+
+    优先级：intra_repeat > fragment > inter_repeat（先标更精确/更具体的，
+    同一索引已被标注则不覆盖），避免同一句被 inter 与 fragment 双重计数。
+    """
+    detect_dir = analysis_dir / "detect"
+    cats: dict[int, str] = {}
+
+    def mark(ranges: list[tuple[int, int]], typ: str) -> None:
+        for r in ranges:
+            if not r:
+                continue
+            a, b = r
+            for i in range(a, b + 1):
+                cats.setdefault(i, typ)
+
+    # 收集所有「已应用」的决策条目
+    applied: list[dict] = []
+    for name in ("inter", "intra", "fragment"):
+        p = detect_dir / f"judge_decisions_{name}.json"
+        if not p.exists():
+            p = detect_dir / f"decisions_{name}.json"  # 兼容旧格式
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = []
+            for e in data if isinstance(data, list) else []:
+                if isinstance(e, dict) and e.get("status", "applied") == "applied":
+                    applied.append(e)
+
+    loop_p = analysis_dir / "review_loop_decisions.json"
+    if loop_p.exists():
+        try:
+            loop_data = json.loads(loop_p.read_text(encoding="utf-8"))
+        except Exception:
+            loop_data = []
+        for e in loop_data if isinstance(loop_data, list) else []:
+            if isinstance(e, dict) and (e.get("decision", {}) or {}).get("confirmed"):
+                applied.append(e)
+
+    # 按优先级分类后逐类标注（先精确/具体，first-wins）
+    buckets: dict[str, list[list[tuple[int, int]]]] = {
+        "intra_repeat": [], "fragment": [], "inter_repeat": [],
+    }
+    for e in applied:
+        typ, ranges = _entry_indices(e)
+        if typ in buckets and ranges:
+            buckets[typ].append(ranges)
+
+    for typ in ("intra_repeat", "fragment", "inter_repeat"):
+        for ranges in buckets[typ]:
+            mark(ranges, typ)
+
+    return cats
+
+
 def _generate_review_html(
     words_json: Path, review_auto: Path, video: Path, review_dir: Path,
+    categories_json: Path | None = None,
 ) -> None:
     """调用 generate_review.js 生成 review.html（需要 node）。"""
     gen_script = _THIS_DIR / "generate_review.js"
@@ -137,11 +253,12 @@ def _generate_review_html(
         print("   （请手动确保 3_审核/review.html 存在）")
         return
     try:
-        subprocess.run(
-            ["node", str(gen_script.resolve()),
-             str(words_json.resolve()), str(review_auto.resolve()), str(video.resolve())],
-            cwd=str(review_dir), check=True,
-        )
+        cmd = ["node", str(gen_script.resolve()),
+               str(words_json.resolve()), str(review_auto.resolve()),
+               str(video.resolve())]
+        if categories_json is not None:
+            cmd.append(str(categories_json.resolve()))
+        subprocess.run(cmd, cwd=str(review_dir), check=True)
         print(f"  已生成: review.html（含预选 {len(json.loads(review_auto.read_text(encoding='utf-8')))} 项）")
     except subprocess.CalledProcessError as e:
         print(f"⚠️ generate_review.js 执行失败: {e}")
@@ -220,7 +337,7 @@ def run_review(
          剪辑时按 silence_keep_duration 在静音 gap 内保留呼吸感。
 
     Args:
-        base_dir: 数据根目录（含 剪口播/1_转录、剪口播/2_分析）
+        base_dir: 数据根目录（含 1_转录、2_分析）
         port:     审核服务器端口（默认 8899）
         autoselect: 仅自动预选 SILENCE_GAP_THRESHOLD 以上的静音片段
         silence_gap_threshold: 静音自动预选阈值（秒）
@@ -230,11 +347,11 @@ def run_review(
         serve:     True=生成后启动服务器并阻塞；False=仅准备目录
     """
     base_dir = Path(base_dir)
-    analysis_dir = base_dir / "剪口播" / "2_分析"
-    review_dir = base_dir / "剪口播" / "3_审核"
+    analysis_dir = base_dir / "2_分析"
+    review_dir = base_dir / "3_审核"
     review_dir.mkdir(parents=True, exist_ok=True)
 
-    words_json = base_dir / "剪口播" / "1_转录" / "subtitles_words.json"
+    words_json = base_dir / "1_转录" / "subtitles_words.json"
     auto_selected_src = analysis_dir / "auto_selected.json"
 
     print("=" * 60)
@@ -274,6 +391,21 @@ def run_review(
     )
     print(f"  已写入: {review_auto.name} ({len(preselect)} 项)")
 
+    # --- 构建「字级索引 → 错误类型」映射（供 review 页三类分类计数）---
+    word_categories = _build_word_categories(analysis_dir)
+    categories_json = review_dir / "word_categories.json"
+    categories_json.write_text(
+        json.dumps({str(k): v for k, v in sorted(word_categories.items())},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _cat_stat = {t: sum(1 for v in word_categories.values() if v == t)
+                 for t in ("inter_repeat", "intra_repeat", "fragment")}
+    print(f"  已写入: {categories_json.name} "
+          f"（句间重复 {_cat_stat['inter_repeat']} / "
+          f"句内重复 {_cat_stat['intra_repeat']} / "
+          f"残句 {_cat_stat['fragment']} 词）")
+
     # --- 视频文件 ---
     video = Path(video_file) if video_file else _find_video(base_dir)
     if not video or not video.exists():
@@ -282,7 +414,7 @@ def run_review(
     print(f"  视频: {video}")
 
     # --- 生成 review.html ---
-    _generate_review_html(words_json, review_auto, video, review_dir)
+    _generate_review_html(words_json, review_auto, video, review_dir, categories_json)
 
     if not serve:
         print(f"\n✅ 审核目录已准备: {review_dir}")

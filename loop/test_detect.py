@@ -18,8 +18,8 @@
 
   # 换一篇文稿（验证泛化能力）
   python -m speech_error_detector.loop.test_detect \
-      --sentences ../2026-07-07_福总/剪口播/2_分析/sentences.txt \
-      --words   ../2026-07-07_福总/剪口播/1_转录/subtitles_words.json
+      --sentences ../2026-07-07_福总/2_分析/sentences.txt \
+      --words   ../2026-07-07_福总/1_转录/subtitles_words.json
 
   # 完整循环（忠实复刻真实运行）
   python -m speech_error_detector.loop.test_detect --full
@@ -47,21 +47,25 @@ from speech_error_detector.detect.rule_corroborate import rule_corroborate
 # 默认用福总清洗后的文稿做快速测试
 # BASE = "2026-07-07_福总"
 BASE = "2026-07-07_红姐"
-DEFAULT_SENTENCES = ROOT / BASE / "剪口播/2_分析/sentences.txt"
-DEFAULT_WORDS = ROOT / BASE / "剪口播/1_转录/subtitles_words.json"
+DEFAULT_SENTENCES = ROOT / BASE / "2_分析/sentences.txt"
+DEFAULT_WORDS = ROOT / BASE / "1_转录/subtitles_words.json"
 TEST_DIR = ROOT / "speech_error_detector/loop/test_output"
 
 
 def _derive_original_script(sentences_path: Path) -> Path | None:
     """由原稿 sentences.txt 路径推断 original_script.txt 位置：
-    .../2_分析/sentences.txt -> .../1_转录/original_script.txt
+    原稿放在项目根目录下，故从 2_分析 上溯两级到根目录。
     """
     p = sentences_path
+    # 2_分析/sentences.txt -> 根目录/original_script.txt
     if p.parent.name == "2_分析":
-        cand = p.parent.parent / "1_转录" / "original_script.txt"
+        cand = p.parent.parent / "original_script.txt"
         if cand.exists():
             return cand
-    for cand in (p.parent / "original_script.txt", p.parent.parent / "original_script.txt"):
+    # 兜底：向上逐级查找（含当前目录）
+    for cand in (p.parent / "original_script.txt",
+                 p.parent.parent / "original_script.txt",
+                 p.parent.parent.parent / "original_script.txt"):
         if cand.exists():
             return cand
     return None

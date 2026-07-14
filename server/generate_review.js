@@ -13,6 +13,7 @@ const { execFileSync } = require('child_process');
 const subtitlesFile = process.argv[2] || 'subtitles_words.json';
 const autoSelectedFile = process.argv[3] || 'auto_selected.json';
 const videoFile = process.argv[4] || 'video.mp4';
+const categoriesFile = process.argv[5] || 'word_categories.json';
 
 // 创建视频文件的符号链接到当前目录（避免复制大文件）
 const videoBaseName = 'video.mp4';
@@ -38,6 +39,17 @@ let autoSelected = [];
 if (fs.existsSync(autoSelectedFile)) {
   autoSelected = JSON.parse(fs.readFileSync(autoSelectedFile, 'utf8'));
   console.log('AI 预选:', autoSelected.length, '个元素');
+}
+
+// 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment），由 review_entry.py 生成
+let wordCategories = {};
+if (fs.existsSync(categoriesFile)) {
+  try {
+    wordCategories = JSON.parse(fs.readFileSync(categoriesFile, 'utf8'));
+    console.log('错误类型映射:', Object.keys(wordCategories).length, '个词');
+  } catch (e) {
+    console.warn('⚠️ 解析 word_categories.json 失败，类型计数将为 0');
+  }
 }
 
 function readVideoAspectRatio(file) {
@@ -845,8 +857,9 @@ const html = `<!DOCTYPE html>
         <button class="filter-btn active" data-filter="all" onclick="setFilter('all',this)">全部 <span id="fAll">0</span></button>
         <button class="filter-btn" data-filter="silence" onclick="setFilter('silence',this)">静音 <span id="fSilence">0</span></button>
         <button class="filter-btn" data-filter="filler" onclick="setFilter('filler',this)">语气词 <span id="fFiller">0</span></button>
-        <button class="filter-btn" data-filter="stutter" onclick="setFilter('stutter',this)">卡顿 <span id="fStutter">0</span></button>
-        <button class="filter-btn" data-filter="repeat" onclick="setFilter('repeat',this)">重说 <span id="fRepeat">0</span></button>
+        <button class="filter-btn" data-filter="fragment" onclick="setFilter('fragment',this)">残句 <span id="fFragment">0</span></button>
+        <button class="filter-btn" data-filter="inter_repeat" onclick="setFilter('inter_repeat',this)">句间重复 <span id="fInter">0</span></button>
+        <button class="filter-btn" data-filter="intra_repeat" onclick="setFilter('intra_repeat',this)">句内重复 <span id="fIntra">0</span></button>
         <span class="filter-summary">已选 <span id="selCount">0</span> / <span id="totalCount">0</span></span>
       </div>
 
@@ -883,6 +896,8 @@ const html = `<!DOCTYPE html>
     const words = ${JSON.stringify(words)};
     const autoSelected = new Set(${JSON.stringify(autoSelected)});
     const selected = new Set(autoSelected);
+    // 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment），由 review_entry.py 生成
+    const wordCategories = ${JSON.stringify(wordCategories)};
 
     // 自动保存状态（必须在 rebuildSkipIntervals 之前声明，否则 TDZ）
     let saveTimer = null;
@@ -996,19 +1011,19 @@ const html = `<!DOCTYPE html>
     }
 
     // ─── 预选分类统计 ───
+    // 类型来自 word_categories.json：inter_repeat(句间重复) / intra_repeat(句内重复) / fragment(残句)
     function categorize(i) {
       const w = words[i];
       if (w.isGap) return 'silence';
       const t = (w.text || '').trim().toLowerCase();
       if (/^(嗯|啊|呃|额|哦|噢|唔|emm|em|uhm|uh|hmm|嘶)$/.test(t)) return 'filler';
-      if (w.reason && /重说|repeat/i.test(w.reason)) return 'repeat';
-      if (w.reason && /卡顿|stutter/i.test(w.reason)) return 'stutter';
-      if (w.reason && /残句/i.test(w.reason)) return 'incomplete';
+      const c = wordCategories[i];
+      if (c === 'inter_repeat' || c === 'intra_repeat' || c === 'fragment') return c;
       return 'other';
     }
 
     function countByCategory() {
-      const counts = { silence: 0, filler: 0, stutter: 0, repeat: 0, incomplete: 0, other: 0 };
+      const counts = { silence: 0, filler: 0, inter_repeat: 0, intra_repeat: 0, fragment: 0, other: 0 };
       autoSelected.forEach(i => {
         const cat = categorize(i);
         if (counts[cat] !== undefined) counts[cat]++;
@@ -1145,6 +1160,7 @@ const html = `<!DOCTYPE html>
       }
       rebuildSkipIntervals();
       updateStats();
+      applyFilterHighlight(false);  // 筛选态下手动增删选中，保持选中框正确
     }
 
     function updateStats() {
@@ -1173,28 +1189,28 @@ const html = `<!DOCTYPE html>
       document.getElementById('fAll').textContent = words.length;
       document.getElementById('fSilence').textContent = counts.silence;
       document.getElementById('fFiller').textContent = counts.filler;
-      document.getElementById('fStutter').textContent = counts.stutter;
-      document.getElementById('fRepeat').textContent = counts.repeat;
+      document.getElementById('fInter').textContent = counts.inter_repeat;
+      document.getElementById('fIntra').textContent = counts.intra_repeat;
+      document.getElementById('fFragment').textContent = counts.fragment;
     }
 
     // ─── Filter ───
-    function setFilter(type, btn) {
-      activeFilter = type;
-      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
+    function clearFilterHighlight() {
+      elements.forEach(el => {
+        if (!el) return;
+        el.style.outline = '';
+        el.style.outlineOffset = '';
+        el.style.borderRadius = '';
+      });
+    }
 
-      if (type === 'all') {
-        // 显示所有
-        elements.forEach(el => { if (el) el.style.display = ''; });
-        document.querySelectorAll('.chapter-header').forEach(h => h.style.display = '');
-        return;
-      }
-
-      // 高亮该类型，滚到第一个
+    // 高亮当前分类对应字的选中框（scroll=true 时滚动到首个）
+    function applyFilterHighlight(scroll) {
+      if (!activeFilter || activeFilter === 'all') return;
       let first = null;
       elements.forEach((el, i) => {
         if (!el) return;
-        if (autoSelected.has(i) && categorize(i) === type) {
+        if (autoSelected.has(i) && categorize(i) === activeFilter) {
           el.style.display = '';
           el.style.outline = '2px solid var(--accent)';
           el.style.outlineOffset = '1px';
@@ -1204,14 +1220,28 @@ const html = `<!DOCTYPE html>
           el.style.display = '';
           el.style.outline = '';
           el.style.outlineOffset = '';
+          el.style.borderRadius = '';
         }
       });
-      if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (scroll && first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
 
-      // 3 秒后去掉 outline
-      setTimeout(() => {
-        elements.forEach(el => { if (el) { el.style.outline = ''; el.style.outlineOffset = ''; } });
-      }, 3000);
+    function setFilter(type, btn) {
+      activeFilter = type;
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+
+      clearFilterHighlight();
+
+      if (type === 'all') {
+        // 显示所有
+        elements.forEach(el => { if (el) el.style.display = ''; });
+        document.querySelectorAll('.chapter-header').forEach(h => h.style.display = '');
+        return;
+      }
+
+      // 高亮该类型对应字（选中框常亮，不再 3 秒后清除）
+      applyFilterHighlight(true);
     }
 
     // ─── Search ───

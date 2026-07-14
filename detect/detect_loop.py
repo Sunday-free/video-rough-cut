@@ -18,7 +18,7 @@ from speech_error_detector.detect.detect_intra import run_detect_intra
 from speech_error_detector.detect.detect_fragment import run_detect_fragment
 from speech_error_detector.detect.llm_judge import run_all_judges
 from speech_error_detector.base.sentence_io import write_sentences
-from speech_error_detector.base.paths import detect_dir, debug_dir
+from speech_error_detector.base.paths import detect_dir
 
 
 # ============================================================
@@ -583,12 +583,6 @@ def run_detect_judge_loop(
     )
     print(f"   机械检测累计待删 word 数: {len(accumulated_delete)} → 已写 {decisions_path.name}")
 
-    # 备份（供检查机械检测投影效果）
-    backup_path = debug_dir(analysis_dir) / "sentences_from_judged_loop.txt"
-    shutil.copy2(sentences_path, backup_path)
-    # 调试文件：机械检测判决后的句子（与 cleaned 同源，仅展示用）
-    silence_judged_path = debug_dir(analysis_dir) / "sentences_from_silence_after_judged.txt"
-    write_sentences(silence_judged_path, cleaned)
     print(f"   已更新: {sentences_path.name} (机械检测清洗后, 共 {det_round} 轮)")
 
     return cleaned, total_candidates, det_round

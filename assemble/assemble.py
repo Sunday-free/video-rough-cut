@@ -596,7 +596,8 @@ def generate_updated_sentences(
     words_json_path: Path,
     sentences: list[dict],
     *,
-    original: list[dict] | None = None,
+    original: list[dict],
+    out_path: Path,
 ) -> str:
     """
     生成修正后的句子列表文件（应用所有删除后）。
@@ -610,9 +611,11 @@ def generate_updated_sentences(
         sentences: 最终句子列表（已应用 Judge + Loop 删除）。必传，不再从
                    sentences.txt 读取。
         original:  可选，删除前全量句子，用于为断档空行补全 range。
+        out_path:  输出文件路径；为 None 时写 updated_sentences.txt（默认）。
+                   传 sentences.txt 路径即可直接覆盖原句子文件。
 
     Returns:
-        updated_sentences.txt 的完整文本内容
+        输出文件的完整文本内容
     """
     auto_path = analysis_dir / "auto_selected.json"
 
@@ -650,6 +653,5 @@ def generate_updated_sentences(
             "text": cleaned_text,
         })
 
-    out_path = analysis_dir / "updated_sentences.txt"
     write_sentences(out_path, out_sentences, original=original)
     return out_path.read_text(encoding="utf-8")

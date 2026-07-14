@@ -34,7 +34,7 @@ EXPECTED = {
 
 from speech_error_detector.detect.detect_fragment import detect_fragment
 
-# ===== 福总 整篇句子（来自 2026-07-07_福总/剪口播/2_分析/sentences.txt）=====
+# ===== 福总 整篇句子（来自 2026-07-07_福总/2_分析/sentences.txt）=====
 # fmt: off
 FUZONG_SENTENCES = [
     {"idx":0,"range":"1-28","text":'4月23日明天周四的行情不用猜了我直接呢把答案甩给你们'},
@@ -88,7 +88,7 @@ FUZONG_SENTENCES = [
 ]
 # fmt: on
 
-# ===== 红姐 整篇句子（来自 2026-07-07_红姐/剪口播/2_分析/sentences.txt）=====
+# ===== 红姐 整篇句子（来自 2026-07-07_红姐/2_分析/sentences.txt）=====
 # fmt: off
 HONGJIE_SENTENCES = [
     {"idx":0,"range":"2-37","text":'假如你手里攥着10万块股价10块的时候你一把梭哈你全砸进去了'},

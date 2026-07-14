@@ -37,8 +37,8 @@ from speech_error_detector.detect.script_window import (
     match_script_position,
 )
 
-_SCRIPT_REL = "2026-07-07_红姐/剪口播/2_分析/original_script.txt"
-_SENT_ROUND1_REL = "2026-07-07_红姐/剪口播/2_分析/detect/sentences_round_1.txt"
+_SCRIPT_REL = "2026-07-07_红姐/original_script.txt"
+_SENT_ROUND1_REL = "2026-07-07_红姐/2_分析/detect/sentences_round_1.txt"
 
 
 def _load_script() -> str:

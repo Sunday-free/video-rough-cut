@@ -32,13 +32,13 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from speech_error_detector.test.test_fragment_pipeline import HONGJIE_SENTENCES
-from speech_error_detector.detect.script_window import (
+from speech_error_detector.detect_repeat.script_window import (
     build_short_org_window,
     match_script_position,
 )
 
 _SCRIPT_REL = "2026-07-07_红姐/original_script.txt"
-_SENT_ROUND1_REL = "2026-07-07_红姐/2_分析/detect/sentences_round_1.txt"
+_SENT_ROUND1_REL = "2026-07-07_红姐/2_分析/detect_repeat/sentences_round_1.txt"
 
 
 def _load_script() -> str:

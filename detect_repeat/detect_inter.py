@@ -1,17 +1,21 @@
 """
-detect_inter.py — 句间重复机械检测
+detect_inter.py — 句间重复机械检测（整句删除专用）
 
-检测策略:
+检测策略（全部产出整句删除候选，删前保后）：
 1. 相邻句头前缀匹配 (head_eq >= 5字)
 2. 隔句重复（中间是短残句）
+3. 子串完全包含（前句完全在後句内 → 前句为冗余残句）
+
+注：凡「前句头部独有、尾部被后句重说（keep_head 保头删尾）」的现象已迁至
+detect_partial.py（句间部分删除），本模块只做整句删除。
 
 输出: detect_inter.json
 """
 
 from pathlib import Path
 
-from . import CN_DIGIT_MAP, normalize_numerals
-from ..base.fillers import MODAL_CHARS
+from speech_error_detector.detect_repeat import CN_DIGIT_MAP, normalize_numerals
+from speech_error_detector.utils.fillers import MODAL_CHARS
 
 
 def head_eq(a: str, b: str, n: int = 5) -> int:
@@ -86,41 +90,7 @@ def detect_inter(sentences: list[dict], original_script: str = "") -> list[dict]
                     "decision_hint": f"删前保后→删除句{sentences[i]['idx']}及中间句{sentences[i+1]['idx']}",
                 })
     
-    # 3. 非前缀子串重叠检测（句子B包含了句子A的大部分内容，但不在开头）
-    #    例: 句A="我一直记到现在..." 句B="...也把我镇住了我一直记到现在..."
-    #    前缀没对上但句B包了句A的大部分 → 句A是前序不完整版本
-    for i in range(len(sentences) - 1):
-        a_text, b_text = sentences[i]["text"], sentences[i + 1]["text"]
-        na, nb = _norm(a_text), _norm(b_text)
-        if len(na) < 8 or len(nb) < 12:
-            continue
-        
-        # 用滑动窗口检测：从 A 的多个偏移位置取子串，检查是否在 B 中
-        max_overlap = 0
-        for start in range(1, min(len(na) - 8, 12)):
-            # 从 start 开始取最长子串在 B 中匹配
-            remaining = na[start:]
-            for win_len in range(min(len(remaining), 30), 7, -1):
-                sub = remaining[:win_len]
-                if sub in nb:
-                    max_overlap = max(max_overlap, win_len)
-                    break
-        
-        if max_overlap >= 10 and len(a_text) > 0:
-            findings.append({
-                "type": "inter_repeat",
-                "subtype": "非前缀子串重叠",
-                "sent_a_idx": sentences[i]["idx"],
-                "sent_a_range": sentences[i]["range"],
-                "sent_b_idx": sentences[i + 1]["idx"],
-                "sent_b_range": sentences[i + 1]["range"],
-                "text_a": a_text,
-                "text_b": b_text,
-                "common_prefix_len": max_overlap,
-                "head_a": a_text[:8],
-                "head_b": b_text[:8],
-                "decision_hint": f"句{sentences[i+1]['idx']}的非头部包含了句{sentences[i]['idx']}的大量内容(重叠{max_overlap}字)→疑似前句为残次版本，建议删前保后",
-            })
+    # （非前缀子串重叠 / 尾部重叠 等 keep_head 现象已迁至 detect_partial.py）
 
     # 4. 子串完全包含（句A 是句B 的子串 → 句A 为冗余残句）
     #    例: 句A="6万4的资金" 句B="八块成交到手6万4的资金" → A 完全包含于 B，
@@ -148,48 +118,10 @@ def detect_inter(sentences: list[dict], original_script: str = "") -> list[dict]
                 "decision_hint": f"句{sentences[i]['idx']}『{a_text}』(去语气词后)完全包含于句{sentences[i+1]['idx']}，为冗余残句，建议删前保后",
             })
 
-    # 5. 尾部重叠（前句是后句结尾的残次近重复）
-    #    例: 句A="我呢一直是记到现在" 句B="...把我镇住了我一直记到现在"
-    #        A 的句尾 与 B 的句尾 高度一致（差个语气词/赘余字），A 为未完成口误，
-    #        应删前保后。精确/子串匹配会被 呢/是 等差漏掉，故用尾部对齐 + 去语气词。
-    TAIL_K = 4
-    for i in range(len(sentences) - 1):
-        a_text = _norm(sentences[i]["text"])
-        if len(a_text) < 5:
-            continue
-        hit = False
-        for j in range(i + 1, min(i + 3, len(sentences))):
-            b_text = _norm(sentences[j]["text"])
-            k = min(TAIL_K, len(a_text), len(b_text))
-            if k < TAIL_K:
-                continue
-            if (len(a_text) < len(b_text)
-                    and a_text[-k:] == b_text[-k:]):
-                findings.append({
-                    "type": "inter_repeat",
-                    "subtype": "尾部重叠(前句为残次近重复)",
-                    "sent_a_idx": sentences[i]["idx"],
-                    "sent_a_range": sentences[i]["range"],
-                    "sent_b_idx": sentences[j]["idx"],
-                    "sent_b_range": sentences[j]["range"],
-                    "text_a": sentences[i]["text"],
-                    "text_b": sentences[j]["text"],
-                    "common_prefix_len": k,
-                    "head_a": sentences[i]["text"][:8],
-                    "head_b": sentences[j]["text"][:8],
-                    "decision_hint": f"句{sentences[i]['idx']}『{sentences[i]['text']}』句尾与句{sentences[j]['idx']}句尾重叠{k}字(去语气词)，为残次近重复，建议删前保后",
-                })
-                hit = True
-                break
-        if hit:
-            continue
-
     # 去重：同一句子对可能被多个策略命中（如"相邻句头重复"+"子串完全包含"），
     # 保留最具体的 subtype，去除冗余。
     _PRIORITY = {
-        "子串完全包含(前句为残句)": 5,
-        "非前缀子串重叠": 4,
-        "尾部重叠(前句为残次近重复)": 3,
+        "子串完全包含(前句为残句)": 3,
         "相邻句头重复": 2,
         "隔句重复(中间短残句)": 1,
     }

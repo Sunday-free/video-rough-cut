@@ -32,7 +32,7 @@ EXPECTED = {
     36: "后来呢他给我复盘以前做的对照实验我亲眼看见",
 }
 
-from speech_error_detector.detect.detect_fragment import detect_fragment
+from speech_error_detector.detect_repeat.detect_fragment import detect_fragment
 
 # ===== 福总 整篇句子（来自 2026-07-07_福总/2_分析/sentences.txt）=====
 # fmt: off

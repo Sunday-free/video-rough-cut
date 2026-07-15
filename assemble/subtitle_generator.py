@@ -8,7 +8,7 @@ subtitle_generator.py — 字幕轴生成模块
 import json
 from pathlib import Path
 
-from speech_error_detector.base.sentence_io import write_sentences
+from speech_error_detector.utils.sentence_io import write_sentences
 
 
 # ============================================================

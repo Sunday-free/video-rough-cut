@@ -7,13 +7,12 @@ annotated_subtitle.py — 生成带口误标注的字幕 txt
 - 静音部分不标注（正常停顿保留）
 - 循环审查发现的问题按轮次单独列出
 
-输出: 口误标注字幕.txt
 """
 
 import json
 from pathlib import Path
 from speech_error_detector.assemble.assemble import _sentence_range
-from speech_error_detector.base.paths import detect_dir
+from speech_error_detector.utils.paths import detect_repeat_dir, detect_agent_dir
 
 
 def generate_annotated_subtitle(
@@ -39,10 +38,10 @@ def generate_annotated_subtitle(
     
     # 加载 decisions（合并格式，兼容旧格式）
     decisions = {}
-    for name in ["inter", "intra", "fragment"]:
-        p = detect_dir(analysis_dir) / f"judge_decisions_{name}.json"
+    for name in ["inter", "intra", "fragment", "partial"]:
+        p = detect_repeat_dir(analysis_dir) / f"judge_decisions_{name}.json"
         if not p.exists():
-            p = detect_dir(analysis_dir) / f"decisions_{name}.json"
+            p = detect_repeat_dir(analysis_dir) / f"decisions_{name}.json"
         if p.exists():
             with open(p, encoding="utf-8") as f:
                 raw = json.load(f)
@@ -54,7 +53,7 @@ def generate_annotated_subtitle(
         else:
             decisions[name] = []
     
-    loop_decisions_path = analysis_dir / "review_loop_decisions.json"
+    loop_decisions_path = detect_agent_dir(analysis_dir) / "review_loop_decisions.json"
     loop_decisions = []
     if loop_decisions_path.exists():
         with open(loop_decisions_path, encoding="utf-8") as f:
@@ -140,15 +139,20 @@ def generate_annotated_subtitle(
                     error_types.append(f"🔶 残句(整句删): {d.get('llm_reason', '')[:30]}")
                 elif mode == "keep_head":
                     error_types.append(f"🔶 残句(保头删尾): {d.get('llm_reason', '')[:30]}")
+
+        # 句间部分删（保头删尾）
+        for d in decisions.get("partial", []):
+            if d.get("sentence") == sent_idx:
+                mode = d.get("mode", "")
+                if mode == "keep_head":
+                    error_types.append(f"🔸 句间部分删(保头删尾): {d.get('llm_reason', '')[:30]}")
+                elif mode == "full":
+                    error_types.append(f"🔸 句间部分删(整句删): {d.get('llm_reason', '')[:30]}")
         
         sentence_annotations.append((annotated_text, error_types, sent_idx))
     
     # === 组装输出文本 ===
     output_lines = []
-    output_lines.append("=" * 60)
-    output_lines.append("   口误标注字幕（静音部分已隐藏，仅标注口误位置）")
-    output_lines.append("=" * 60)
-    output_lines.append("")
     
     # ---- 第一部分：标注版（带错误标记）----
     output_lines.append("┌" + "─" * 56 + "┐")

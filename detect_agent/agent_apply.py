@@ -5,8 +5,20 @@
   - apply_deletions_to_sentences(): 应用已确认删除（整句删 / 片段裁剪）
   - build_processed_summary(): 汇总已处理项供 detect agent 参考
 
-被 agent_review_loop.py 复用。
+被 review_loop.py 复用。
 """
+
+from speech_error_detector.utils.fillers import MODAL_CHARS
+
+
+def is_modal_only_delete(delete_text: str) -> bool:
+    """delete_text 非空且全部由语气词/叹词(MODAL_CHARS)组成 → 纯语气词删除，应过滤。
+
+    如「呃」重复出现，属自然语流，不在系统处理范围内。
+    """
+    t = (delete_text or "").strip()
+    return bool(t) and all(ch in MODAL_CHARS for ch in t)
+
 
 def build_sent_range_map(sentences: list[dict]) -> dict[int, tuple[int, int]]:
     """构建 {句子编号: (startIdx, endIdx)} 映射"""
@@ -67,8 +79,9 @@ def apply_deletions_to_sentences(
         sid = iss.get("sentence_idx")
         delete_sid = iss.get("delete_sentence_idx", sid)
         
-        if dim in ("inter_repeat", "fragment"):
-            target_sid = delete_sid if dim == "inter_repeat" else sid
+        if dim in ("inter_repeat", "fragment", "misread"):
+            # misread 整删用 delete_sentence_idx（错的句/重说的残句）；fragment 用 sentence_idx
+            target_sid = delete_sid if dim != "fragment" else sid
             if target_sid is not None and target_sid in range_map:
                 full_delete_sids.add(target_sid)
                     

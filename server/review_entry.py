@@ -13,6 +13,8 @@ from pathlib import Path
 
 from speech_error_detector.assemble.subtitle_generator import SILENCE_GAP_THRESHOLD
 from speech_error_detector.assemble.assemble import iter_gap_runs
+from speech_error_detector.utils.paths import detect_agent_dir
+from speech_error_detector.server.review_server import ReviewServer
 
 _THIS_DIR = Path(__file__).resolve().parent  # .../speech_error_detector/server
 
@@ -139,14 +141,26 @@ def _parse_range(s) -> tuple[int, int] | None:
 def _entry_indices(entry: dict) -> tuple[str | None, list[tuple[int, int]]]:
     """从一条决策条目提取 (类型, 受影响的字级索引区间列表)。
 
-    - inter_repeat: 删前句 → 用 sent_a_range（回退 range）。
-    - intra_repeat: 只删精确片段 → 优先 decision.delete_ranges；回退整句 range。
-    - fragment:     mode=keep_head → 删尾部(keep_head 末+1 .. range 末)；
-                    mode=full/其它 → 整句 range。
+    类型归并（按前端 tab 映射，用户确认）：
+      - inter_repeat             → 句间重复
+      - intra_repeat             → 句内重复
+      - fragment                 → 残句
+      - partial（保头删尾）       → 句间重复（区间算法与 fragment 同构，但 tab 归「句间重复」）
+      - misread / off_topic      → 残句（V3 读稿错误：增读/跑题，整句删）
+      - misread / resay          → 残句（V3 读稿错误：残句重说，整句删）
+
+    即：partial → 句间重复；resay / off_topic → 残句。前端只需 inter_repeat / fragment 两类即可承载。
     """
     det = entry.get("detect", entry) or {}
     dec = entry.get("decision", {}) or {}
     typ = det.get("type") or det.get("dimension")
+    sub = det.get("subtype") or ""
+
+    # V3 读稿错误检测：dimension=misread，归并到独立「误读(misread)」tab。
+    #   off_topic（增读/跑题）/ resay（残句重说）均为整句删 → 用整句 range。
+    if typ == "misread":
+        r = _parse_range(det.get("range"))
+        return "misread", ([r] if r else [])
 
     if typ == "intra_repeat":
         dr = dec.get("delete_ranges")
@@ -163,15 +177,19 @@ def _entry_indices(entry: dict) -> tuple[str | None, list[tuple[int, int]]]:
         r = _parse_range(det.get("range"))
         return typ, ([r] if r else [])
 
-    if typ == "fragment":
+    # fragment（残句）/ partial（保头删尾）：区间算法一致。
+    #   partial 按用户映射归「句间重复」tab，fragment 归「残句」tab。
+    if typ in ("fragment", "partial"):
         r = _parse_range(det.get("range"))
+        tail = None
         if dec.get("mode") == "keep_head" and dec.get("keep_head") and r:
             kh = dec["keep_head"]
             try:
-                return typ, [(int(kh[1]) + 1, r[1])]
+                tail = [(int(kh[1]) + 1, r[1])]
             except Exception:
-                return typ, [r]
-        return typ, ([r] if r else [])
+                tail = [r]
+        out_ranges = tail if tail is not None else ([r] if r else [])
+        return ("inter_repeat" if typ == "partial" else "fragment"), out_ranges
 
     if typ == "inter_repeat":
         r = _parse_range(det.get("sent_a_range")) or _parse_range(det.get("range"))
@@ -184,13 +202,13 @@ def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
     """构建 {字级索引: 类型} 映射，类型取值 inter_repeat/intra_repeat/fragment。
 
     数据来源（权威、已应用的决策）：
-      - detect/judge_decisions_{inter,intra,fragment}.json（status == "applied"）
+      - detect_repeat/judge_decisions_{inter,intra,fragment}.json（status == "applied"）
       - review_loop_decisions.json（decision.confirmed == True）
 
     优先级：intra_repeat > fragment > inter_repeat（先标更精确/更具体的，
     同一索引已被标注则不覆盖），避免同一句被 inter 与 fragment 双重计数。
     """
-    detect_dir = analysis_dir / "detect"
+    detect_dir = analysis_dir / "detect_repeat"
     cats: dict[int, str] = {}
 
     def mark(ranges: list[tuple[int, int]], typ: str) -> None:
@@ -203,7 +221,7 @@ def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
 
     # 收集所有「已应用」的决策条目
     applied: list[dict] = []
-    for name in ("inter", "intra", "fragment"):
+    for name in ("inter", "intra", "fragment", "partial"):
         p = detect_dir / f"judge_decisions_{name}.json"
         if not p.exists():
             p = detect_dir / f"decisions_{name}.json"  # 兼容旧格式
@@ -216,26 +234,29 @@ def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
                 if isinstance(e, dict) and e.get("status", "applied") == "applied":
                     applied.append(e)
 
-    loop_p = analysis_dir / "review_loop_decisions.json"
+    loop_p = detect_agent_dir(analysis_dir) / "review_loop_decisions.json"
+    if not loop_p.exists():  # 兼容旧数据（曾放在 analysis_dir 根）
+        loop_p = analysis_dir / "review_loop_decisions.json"
     if loop_p.exists():
         try:
             loop_data = json.loads(loop_p.read_text(encoding="utf-8"))
         except Exception:
             loop_data = []
         for e in loop_data if isinstance(loop_data, list) else []:
-            if isinstance(e, dict) and (e.get("decision", {}) or {}).get("confirmed"):
-                applied.append(e)
+            if isinstance(e, dict) and "detect" in e:
+                applied.append(e)  # 包含 ✅确认/📌仅标注/❌驳回，全部在页面标注
 
     # 按优先级分类后逐类标注（先精确/具体，first-wins）
+    # 归并映射在 _entry_indices 内完成：partial→句间重复；misread(off_topic/resay)→误读。
     buckets: dict[str, list[list[tuple[int, int]]]] = {
-        "intra_repeat": [], "fragment": [], "inter_repeat": [],
+        "intra_repeat": [], "fragment": [], "inter_repeat": [], "misread": [],
     }
     for e in applied:
         typ, ranges = _entry_indices(e)
         if typ in buckets and ranges:
             buckets[typ].append(ranges)
 
-    for typ in ("intra_repeat", "fragment", "inter_repeat"):
+    for typ in ("intra_repeat", "fragment", "inter_repeat", "misread"):
         for ranges in buckets[typ]:
             mark(ranges, typ)
 
@@ -269,8 +290,6 @@ def _start_review_server(
     cut_script_path: Path | None, words_json: Path, silence_keep_duration: float,
 ) -> None:
     """启动审核服务器（端口被占则顺延到下一个空闲端口）。阻塞直到 Ctrl+C。"""
-    from speech_error_detector.server.review_server import ReviewServer
-
     server = None
     used_port = None
     for try_port in range(port, port + 11):
@@ -349,6 +368,10 @@ def run_review(
     base_dir = Path(base_dir)
     analysis_dir = base_dir / "2_分析"
     review_dir = base_dir / "3_审核"
+    # 每次运行前清空旧的审核目录，避免上次 run 残留的 review.html /
+    # auto_selected.json / word_categories.json 干扰本轮审核结果
+    if review_dir.exists():
+        shutil.rmtree(review_dir)
     review_dir.mkdir(parents=True, exist_ok=True)
 
     words_json = base_dir / "1_转录" / "subtitles_words.json"
@@ -365,7 +388,7 @@ def run_review(
         return
     if not auto_selected_src.exists():
         print("❌ 找不到 2_分析/auto_selected.json，请先运行完整 pipeline 检测:")
-        print("   python -m speech_error_detector.pipeline --base-dir <目录>")
+        print("   python -m speech_error_detector.test.run_speech_pipeline   # 或修改 test/run_speech_pipeline.py 的 dirs 常量")
         return
 
     words = json.loads(words_json.read_text(encoding="utf-8"))
@@ -400,11 +423,12 @@ def run_review(
         encoding="utf-8",
     )
     _cat_stat = {t: sum(1 for v in word_categories.values() if v == t)
-                 for t in ("inter_repeat", "intra_repeat", "fragment")}
+                 for t in ("inter_repeat", "intra_repeat", "fragment", "misread")}
     print(f"  已写入: {categories_json.name} "
           f"（句间重复 {_cat_stat['inter_repeat']} / "
           f"句内重复 {_cat_stat['intra_repeat']} / "
-          f"残句 {_cat_stat['fragment']} 词）")
+          f"残句 {_cat_stat['fragment']} / "
+          f"误读 {_cat_stat['misread']} 词）")
 
     # --- 视频文件 ---
     video = Path(video_file) if video_file else _find_video(base_dir)

@@ -98,7 +98,7 @@ const html = `<!DOCTYPE html>
       --highlight-fg: #7c5a10;
       --font-body: "PingFang SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       --font-mono: "SF Mono", "JetBrains Mono", "Menlo", monospace;
-      --sidebar-w: clamp(460px, 42vw, 600px);
+      --sidebar-w: clamp(360px, 24vw, 520px);
       --header-h: 44px;
     }
 
@@ -409,7 +409,7 @@ const html = `<!DOCTYPE html>
       font-size: 13px;
       color: var(--text-faint);
       cursor: text;
-      min-width: 140px;
+      min-width: 120px;
     }
     .search-box input {
       border: none;
@@ -468,7 +468,7 @@ const html = `<!DOCTYPE html>
     }
     .content {
       line-height: 2.4;
-      max-width: 720px;
+      max-width: unset;
     }
 
     /* Chapter header */
@@ -762,7 +762,7 @@ const html = `<!DOCTYPE html>
         display: none;
       }
       .search-box {
-        min-width: 120px;
+        min-width: 100px;
       }
       #time {
         font-size: 12px;
@@ -860,6 +860,7 @@ const html = `<!DOCTYPE html>
         <button class="filter-btn" data-filter="fragment" onclick="setFilter('fragment',this)">残句 <span id="fFragment">0</span></button>
         <button class="filter-btn" data-filter="inter_repeat" onclick="setFilter('inter_repeat',this)">句间重复 <span id="fInter">0</span></button>
         <button class="filter-btn" data-filter="intra_repeat" onclick="setFilter('intra_repeat',this)">句内重复 <span id="fIntra">0</span></button>
+        <button class="filter-btn" data-filter="misread" onclick="setFilter('misread',this)">误读 <span id="fMisread">0</span></button>
         <span class="filter-summary">已选 <span id="selCount">0</span> / <span id="totalCount">0</span></span>
       </div>
 
@@ -1018,12 +1019,12 @@ const html = `<!DOCTYPE html>
       const t = (w.text || '').trim().toLowerCase();
       if (/^(嗯|啊|呃|额|哦|噢|唔|emm|em|uhm|uh|hmm|嘶)$/.test(t)) return 'filler';
       const c = wordCategories[i];
-      if (c === 'inter_repeat' || c === 'intra_repeat' || c === 'fragment') return c;
+      if (c === 'inter_repeat' || c === 'intra_repeat' || c === 'fragment' || c === 'misread') return c;
       return 'other';
     }
 
     function countByCategory() {
-      const counts = { silence: 0, filler: 0, inter_repeat: 0, intra_repeat: 0, fragment: 0, other: 0 };
+      const counts = { silence: 0, filler: 0, inter_repeat: 0, intra_repeat: 0, fragment: 0, misread: 0, other: 0 };
       autoSelected.forEach(i => {
         const cat = categorize(i);
         if (counts[cat] !== undefined) counts[cat]++;
@@ -1192,6 +1193,7 @@ const html = `<!DOCTYPE html>
       document.getElementById('fInter').textContent = counts.inter_repeat;
       document.getElementById('fIntra').textContent = counts.intra_repeat;
       document.getElementById('fFragment').textContent = counts.fragment;
+      document.getElementById('fMisread').textContent = counts.misread;
     }
 
     // ─── Filter ───

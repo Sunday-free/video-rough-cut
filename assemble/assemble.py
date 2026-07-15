@@ -7,8 +7,8 @@ assemble.py — 步骤5: 装配 auto_selected.json + 口误分析报告
 import json
 import os
 from pathlib import Path
-from speech_error_detector.base.paths import detect_dir
-from speech_error_detector.base.sentence_io import write_sentences
+from speech_error_detector.utils.paths import detect_repeat_dir, detect_agent_dir
+from speech_error_detector.utils.sentence_io import write_sentences
 
 
 # ============================================================
@@ -336,11 +336,11 @@ def generate_report_markdown(
     
     # 加载 judge decisions（合并格式）做摘要 + 计数
     summaries = {}
-    judge_counts = {"inter": 0, "intra": 0, "fragment": 0}
-    for name in ["inter", "intra", "fragment"]:
-        p = detect_dir(analysis_dir) / f"judge_decisions_{name}.json"
+    judge_counts = {"inter": 0, "intra": 0, "fragment": 0, "partial": 0}
+    for name in ["inter", "intra", "fragment", "partial"]:
+        p = detect_repeat_dir(analysis_dir) / f"judge_decisions_{name}.json"
         if not p.exists():
-            p = detect_dir(analysis_dir) / f"decisions_{name}.json"  # 兼容旧格式
+            p = detect_repeat_dir(analysis_dir) / f"decisions_{name}.json"  # 兼容旧格式
         if p.exists():
             with open(p, encoding="utf-8") as f:
                 data = json.load(f)
@@ -356,13 +356,30 @@ def generate_report_markdown(
         else:
             summaries[name] = []
 
-    loop_path = analysis_dir / "review_loop_decisions.json"
+    # 循环审查决策：统一加载 review_loop_decisions.json（v1/v2/v3/福总 同名），
+    # 并兼容可能存在的 review_loop_*_decisions.json（v1/v2 历史残留）；按文件名排序后合并。
     loop_decisions = []
-    if loop_path.exists():
-        with open(loop_path, encoding="utf-8") as f:
-            loop_decisions = json.load(f)
-    # confirmed 位于 decision 子对象内
-    applied_loop = [d for d in loop_decisions if d.get("decision", {}).get("confirmed") is True]
+    _loop_p = detect_agent_dir(analysis_dir)
+    candidates = list(analysis_dir.glob("review_loop_*_decisions.json"))
+    candidates += list(_loop_p.glob("review_loop_*_decisions.json"))
+    legacy = analysis_dir / "review_loop_decisions.json"
+    if legacy.exists():
+        candidates.append(legacy)
+    loop_legacy = _loop_p / "review_loop_decisions.json"
+    if loop_legacy.exists():
+        candidates.append(loop_legacy)
+    for lp in sorted(candidates, key=lambda p: p.name):
+        try:
+            with open(lp, encoding="utf-8") as f:
+                loop_decisions.extend(json.load(f))
+        except Exception:
+            pass
+    # 循环审查「补充删除」= confirmed 且 非仅标注（action 缺失视为 delete，兼容 福总 纯 confirmed 格式）
+    applied_loop = [
+        d for d in loop_decisions
+        if d.get("decision", {}).get("confirmed") is True
+        and d.get("decision", {}).get("action") != "report"
+    ]
     
     md = f"""# 口误分析报告
 
@@ -379,7 +396,8 @@ def generate_report_markdown(
 | 语气词（呃/哎） | {stats['filler']} | 明显犹豫；啊/呀保留 |
 | 句间重复 | {judge_counts['inter']} 项 | 被后句完整重说覆盖 |
 | 句内重复 | {judge_counts['intra']} 项 | 精确片段删除 |
-| 残句 | {judge_counts['fragment']} 项 | 保头删尾 / 整句删 |
+| 残句 | {judge_counts['fragment']} 项 | 整句删除（孤立编号/极短孤立句） |
+| 句间部分删 | {judge_counts['partial']} 项 | 保头删尾（头部独有、尾部被重说） |
 | 循环审查补充 | {len(applied_loop)} 项 | Detect+Verify 循环确认删除 |
 
 ## 二、关键判断（LLM）
@@ -402,6 +420,15 @@ def generate_report_markdown(
     if summaries.get("fragment"):
         md += "\n- **残句**：\n"
         for d in summaries["fragment"]:
+            reason = d.get("llm_reason", "")
+            mode = d.get("mode", "")
+            sent = d.get("sentence", "")
+            md += f"  - 句{sent} ({mode}): {reason}\n"
+
+    # partial 摘要
+    if summaries.get("partial"):
+        md += "\n- **句间部分删（保头删尾）**：\n"
+        for d in summaries["partial"]:
             reason = d.get("llm_reason", "")
             mode = d.get("mode", "")
             sent = d.get("sentence", "")
@@ -436,16 +463,22 @@ def _fmt_dedup_finding(det_type: str, fnd: dict) -> str:
         return f"句{fnd.get('sent_idx', '?')}"
     if det_type == "fragment":
         return f"句{fnd.get('sent_idx', '?')} [{fnd.get('subtype', '')}]"
+    if det_type == "partial":
+        return f"句{fnd.get('sent_idx', '?')} [{fnd.get('subtype', '')}]"
     return str(fnd)
 
 
 def _build_dedup_section(analysis_dir: Path) -> str:
     """从 detect_history.json 构建「跨轮检测去重记录」章节。
 
-    展示每轮：候选数 / 送研判数 / 跳过(重复或级联)数，并逐条列出被跳过的问题
-    及其原因（精确去重 = 前轮已研判过；级联抑制 = 前轮整句删除造成的新邻接句重叠）。
+    展示每轮：候选数 / 送研判数 / 跳过数，并逐条列出被跳过的问题及其原因。
+    跳过来源（skip.stage）有两种：
+      - dedupe_suppress：跨轮精确去重（前轮已研判过同一问题，不再重复送 LLM）；
+      - filter_repeat_in_org_window：原稿窗口内重复排除（待删段原稿窗口中亦重复，忠于原稿/排比，排除）。
+    注：candidates 上已原地打 skip 标记，不再有独立的 skipped 字段；
+       送研判数 = 候选数 - 跳过数（不再单独存 judged 字段，可由 skip 推导）。
     """
-    hist_path = detect_dir(analysis_dir) / "detect_history.json"
+    hist_path = detect_repeat_dir(analysis_dir) / "detect_history.json"
     if not hist_path.exists():
         return ""
     try:
@@ -458,21 +491,31 @@ def _build_dedup_section(analysis_dir: Path) -> str:
     total_cand = sum(
         sum(len(v) for v in r.get("candidates", {}).values()) for r in history
     )
-    total_judged = sum(
-        sum(len(v) for v in r.get("judged", {}).values()) for r in history
-    )
+    # 送研判数：新格式不再单独存 judged，由「候选数 - 跳过数」推导；
+    # 旧格式文件若仍存有 judged 字段则直接用（向后兼容）。
+    def _round_judged(r):
+        if "judged" in r:
+            return sum(len(v) for v in r["judged"].values())
+        cand = r.get("candidates", {})
+        nc = sum(len(v) for v in cand.values())
+        ns = sum(1 for v in cand.values() for f in v if f.get("skip"))
+        return nc - ns
+    total_judged = sum(_round_judged(r) for r in history)
+    # candidates 上已原地打 skip 标记，据此统计跳过数（不再有独立的 skipped 字段）
     total_skipped = sum(
-        sum(len(v) for v in r.get("skipped", {}).values()) for r in history
+        sum(1 for v in r.get("candidates", {}).values() for f in v if f.get("skip"))
+        for r in history
     )
 
     section = (
         f"\n\n## 四、跨轮检测去重记录\n\n"
-        f"> 多轮检测中，凡「前轮已研判过的问题」会被精确去重（不再重复送 LLM / 重复应用）；"
-        f"前轮整句删除后相邻句变成新邻接对而触发的重叠（级联）也会被抑制。\n\n"
+        f"> 多轮检测中，凡「前轮已研判过的问题」会被精确去重（不再重复送 LLM / 重复应用，"
+        f"标记 stage=dedupe_suppress）；待删段在原稿窗口中亦重复（忠于原稿/排比）的会被原稿窗口内重复"
+        f"排除（标记 stage=filter_repeat_in_org_window）。两者均直接在原 candidate 上打 skip 标记。\n\n"
         f"- **检测轮次**: {len(history)} 轮\n"
         f"- **累计候选异常**: {total_cand} 项\n"
         f"- **送 LLM 研判**: {total_judged} 项\n"
-        f"- **跳过(重复/级联)**: {total_skipped} 项\n"
+        f"- **跳过(去重/窗口重复)**: {total_skipped} 项\n"
     )
 
     if total_skipped == 0:
@@ -482,17 +525,21 @@ def _build_dedup_section(analysis_dir: Path) -> str:
     for r in history:
         rnd = r.get("round", "?")
         cand = r.get("candidates", {})
-        judged = r.get("judged", {})
-        skipped = r.get("skipped", {})
+        # 从 candidates 收集被跳过的项（每条自带 skip 标记，skip.stage 区分来源）
+        skipped = {
+            dt: [f for f in cand.get(dt, []) if f.get("skip")]
+            for dt in ("inter", "intra", "fragment", "partial")
+        }
         ncand = sum(len(v) for v in cand.values())
-        njudged = sum(len(v) for v in judged.values())
         nskipped = sum(len(v) for v in skipped.values())
+        # 送研判数：优先用存盘 judged（旧格式），否则由 candidates - skip 推导
+        njudged = _round_judged(r)
         if nskipped == 0:
             continue  # 只有发生跳过的轮次才展开明细，避免刷屏
         section += (
             f"\n### 第 {rnd} 轮（候选 {ncand} / 送研判 {njudged} / 跳过 {nskipped}）\n\n"
         )
-        for det_type in ("inter", "intra", "fragment"):
+        for det_type in ("inter", "intra", "fragment", "partial"):
             items = skipped.get(det_type, [])
             if not items:
                 continue
@@ -500,12 +547,23 @@ def _build_dedup_section(analysis_dir: Path) -> str:
                 "inter": "句间重复",
                 "intra": "句内重复",
                 "fragment": "残句",
+                "partial": "句间部分删",
             }.get(det_type, det_type)
+            # stage 中文名：dedupe_suppress=跨轮去重；filter_repeat_in_org_window=原稿窗口重复排除。
+            # 保留旧键 filter_faithful 以兼容历史 detect_history.json 重处理。
+            stage_label = {
+                "dedupe_suppress": "跨轮去重",
+                "filter_repeat_in_org_window": "原稿窗口重复排除",
+                "filter_faithful": "原稿忠诚度",  # 兼容历史
+            }
             section += f"- **{label}**（跳过 {len(items)} 项）：\n"
             for it in items:
-                fnd = it.get("finding", {})
-                reason = it.get("reason", "")
-                section += f"  - {_fmt_dedup_finding(det_type, fnd)} → {reason}\n"
+                fnd = it  # it 即原始 candidate，自带 skip 标记
+                sk = it.get("skip", {})
+                reason = sk.get("reason", "")
+                stg = stage_label.get(sk.get("stage", ""), "")
+                stg_str = f" [{stg}]" if stg else ""
+                section += f"  - {_fmt_dedup_finding(det_type, fnd)} → {reason}{stg_str}\n"
 
     return section
 
@@ -530,41 +588,60 @@ def _get_field(obj, key: str, default: str = ""):
 
 
 def _build_loop_section(decisions: list) -> str:
-    """从 review_loop_decisions.json 构建循环审查详情（按轮次，含 detect + 确认/驳回）"""
+    """从 review_loop_decisions.json 构建循环审查详情（按轮次，含 detect + 删除/仅标注/驳回）
+
+    三类：
+      - ✅ 确认删除：confirmed 且 action != "report"（action 缺失视为 delete，兼容 福总）
+      - 📌 仅标注：confirmed 且 action == "report"（确认是错误但不删，留人工纠正）
+      - ❌ 驳回：confirmed is not True
+    """
     if not decisions:
         return ""
 
     def _confirmed(d: dict) -> bool:
         return d.get("decision", {}).get("confirmed") is True
 
-    applied = [d for d in decisions if _confirmed(d)]
+    def _is_report(d: dict) -> bool:
+        # 仅标注须同时满足 confirmed 且 action=="report"；
+        # confirmed 为 False 时 action 字段无意义（确认 agent 可能返回矛盾组合），一律按驳回处理
+        return _confirmed(d) and d.get("decision", {}).get("action") == "report"
+
+    def _is_delete(d: dict) -> bool:
+        return _confirmed(d) and not _is_report(d)
+
+    applied = [d for d in decisions if _is_delete(d)]
+    reported = [d for d in decisions if _is_report(d)]
     rejected = [d for d in decisions if not _confirmed(d)]
 
     dim_label = {
         "inter_repeat": "句间重复",
         "intra_repeat": "句内/跨句裁剪",
         "fragment": "残缺句子",
+        "misread": "读稿错误",
     }
     sev_label = {"critical": "🔴", "major": "🟠", "minor": "🟡"}
 
-    # 按轮次分组全部决策（同时含确认 + 驳回）
+    # 按轮次分组全部决策（同时含 删除 / 仅标注 / 驳回）
     rounds: dict[int, list] = {}
     for d in decisions:
         rounds.setdefault(d.get("round", 0), []).append(d)
 
     section = (
         f"\n\n## 三、循环审查详情"
-        f"（共 {len(decisions)} 项检出：✅ 确认删除 {len(applied)} / ❌ 驳回 {len(rejected)}，"
+        f"（共 {len(decisions)} 项检出：✅ 确认删除 {len(applied)} / "
+        f"📌 仅标注 {len(reported)} / ❌ 驳回 {len(rejected)}，"
         f"{len(rounds)} 轮）\n\n"
     )
 
     for rnd in sorted(rounds.keys()):
         items = rounds[rnd]
-        rnd_applied = [d for d in items if _confirmed(d)]
+        rnd_applied = [d for d in items if _is_delete(d)]
+        rnd_reported = [d for d in items if _is_report(d)]
         rnd_rejected = [d for d in items if not _confirmed(d)]
         section += (
             f"### Round {rnd}"
-            f"（检出 {len(items)} 项：确认 {len(rnd_applied)} / 驳回 {len(rnd_rejected)}）\n\n"
+            f"（检出 {len(items)} 项：删除 {len(rnd_applied)} / 仅标注 {len(rnd_reported)} "
+            f"/ 驳回 {len(rnd_rejected)}）\n\n"
         )
 
         for iss in items:
@@ -575,11 +652,15 @@ def _build_loop_section(decisions: list) -> str:
             sid = detect.get("sentence_idx", "?")
             err_text = (detect.get("error_text") or detect.get("delete_text", ""))
             reason = (decision.get("reason") or decision.get("llm_reason", ""))
-            mark = "✅" if _confirmed(iss) else "❌"
+            if _is_delete(iss):
+                mark, label = "✅", "确认理由"
+            elif _is_report(iss):
+                mark, label = "📌", "仅标注理由"
+            else:
+                mark, label = "❌", "驳回理由"
 
             section += f"- {mark} **[{sev}] [{dim}] 句{sid}** 「{err_text}」\n"
             if reason:
-                label = "确认理由" if _confirmed(iss) else "驳回理由"
                 section += f"  - {label}: {reason}\n"
 
         section += "\n"

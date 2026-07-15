@@ -1,27 +1,25 @@
 """
-pipeline.py — 口误检测主入口（五层架构）
+speech_pipeline.py — 口误检测主入口（五层架构）
+
+循环审查固定使用 V3（speech_error_detector.agent_review，对照原稿找"说错"）。
+完整运行入口(main) 与写死参数已移到 test/run_speech_pipeline.py。
 
 执行流程:
   步骤0: gen_texts()     → readable.txt + sentences.txt
   步骤1-4: detect_loop    → 机械检测 + 研判 + 应用（多轮收敛）
-  步骤5-7: Agent 循环审查 → review_loop_decisions.json
+  步骤5-7: V3 Agent 循环审查 → review_loop_decisions.json
   步骤8:   assemble()     → auto_selected.json（合并 Judge + 循环审查 + 静音/语气词）
-  步骤9:   字幕生成         → 口误标注字幕.txt
-  步骤10:  修正后句子       → 直接写回 sentences.txt（不再另存 updated_sentences.txt）
+  步骤9:  修正后句子       → 直接写回 sentences.txt（不再另存 updated_sentences.txt）
 
-用法（参数全部写死，改文件底部「写死的默认参数」常量即可）:
-  python -m speech_error_detector.pipeline
+编程入口:
+  from speech_error_detector.speech_pipeline import run_pipeline
 
-写死常量:
-  BASE_DIR   数据根目录（红姐 / 福总 / man姐...）
-  STEP       运行阶段: all(完整流程) | transcribe(仅视频→音频→火山识别→1_转录) | detect(仅检测) | review(仅审核)
-  VIDEO_FILE transcribe 用的视频路径；None 则自动探测 base_dir 下视频
-  LOOP_VERSION 循环审查模式: v1=单检测单验证; v2=按类型拆专职 Agent 三分
+运行整条流水线 + 审核:
+  python -m speech_error_detector.test.run_speech_pipeline
 未发现 1_转录 目录时，run_pipeline 会自动从目录内视频转录。
 """
 
 import json
-from mimetypes import init
 import shutil
 import sys
 import time
@@ -31,20 +29,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-from speech_error_detector.detect.detect_loop import run_detect_judge_loop
+from speech_error_detector.detect_repeat.detect_loop import run_detect_judge_loop
 from speech_error_detector.assemble.assemble import run_assemble, generate_report_markdown, generate_updated_sentences
-from speech_error_detector.loop.agent_review_loop import run_review_loop
-from speech_error_detector.base.sentence_io import load_sentences, write_sentences
-from speech_error_detector.base.paths import loop_dir, make_subdirs
-from speech_error_detector.assemble.annotated_subtitle import generate_annotated_subtitle
+from speech_error_detector.detect_agent.review_loop import run_agent_review_loop_v3
+from speech_error_detector.detect_agent.agent_apply import apply_deletions_to_sentences
+from speech_error_detector.utils.sentence_io import load_sentences, write_sentences
+from speech_error_detector.utils.paths import detect_agent_dir, make_subdirs
 from speech_error_detector.assemble.subtitle_generator import (
     generate_readable_txt,
     generate_sentences_txt,
     generate_subtitles_words,
 )
-from speech_error_detector.base.audio_extractor import extract_audio, get_video_info
-from speech_error_detector.base.volcengine_transcriber import transcribe
-from speech_error_detector.server.review_entry import run_review
+from speech_error_detector.utils.audio_extractor import extract_audio, get_video_info
+from speech_error_detector.utils.volcengine_transcriber import transcribe
 
 
 # 视频扩展名（自动探测目录内视频用）
@@ -64,6 +61,7 @@ def _find_video(base_dir: Path) -> Path | None:
 def transcribe_video(
     base_dir: str | Path,
     video_file: str | Path | None = None,
+    language: str = "zh-CN",
 ) -> Path:
     """从目录里的视频提取音频 → 火山识别 → 创建 1_转录 转录目录。
 
@@ -76,6 +74,7 @@ def transcribe_video(
     Args:
         base_dir:   项目目录（视频 + optional original_script.txt 所在）
         video_file: 视频路径；为 None 时自动探测 base_dir 下的视频
+        language:   识别语言（透传给火山 ASR）
 
     Returns:
         transcript_dir (Path) = base_dir / "1_转录"
@@ -100,7 +99,7 @@ def transcribe_video(
     print(f"   🎧 音频: {Path(audio_path).name}")
 
     # 3) 火山识别
-    result_json, _ = transcribe(Path(audio_path), transcript_dir)
+    result_json, _ = transcribe(Path(audio_path), transcript_dir, language=language)
     print(f"   📝 转录结果: {result_json.name}")
 
     # 4) 转字级时间轴
@@ -146,7 +145,7 @@ def _prepare_analysis_dir(base_dir: Path, skip_loop: bool = False) -> Path:
     make_subdirs(analysis_dir)
     # 非 skip_loop → 清空 loop 子目录（旧循环审查文件会干扰新结果）
     if not skip_loop:
-        _loop = loop_dir(analysis_dir)
+        _loop = detect_agent_dir(analysis_dir)
         for _f in _loop.iterdir():
             if _f.is_file():
                 _f.unlink()
@@ -170,7 +169,6 @@ def _run_review_loop_phase(
     use_original_script: bool,
     original_script: str,
     cleaned: list[dict],
-    loop_version: str,
     enable_deepseek_thinking: bool,
     sentences_path: Path,
     original_sentences: list[dict],
@@ -179,31 +177,61 @@ def _run_review_loop_phase(
 ) -> tuple[list[dict], list[dict]]:
     """步骤5-7: Agent 循环审查。返回 (最终句子列表, 循环审查决策列表)。"""
     if skip_loop:
+        # 跳过 loop agent，但复用磁盘上已存在的 review_loop_decisions.json：
+        # 把其中「已确认删除」(confirmed 且 action != "report") 的决策真正投影进 sentences.txt，
+        # 使正文与报告（报告恒读该缓存）保持一致；不再像旧逻辑那样只返回 cleaned 导致报告谎报。
         print("-" * 40)
-        print("[步骤5-7] 跳过 Agent 循环审查（不运行 loop agent，也不加载缓存）")
+        print("[步骤5-7] 跳过 Agent 循环审查：复用磁盘 review_loop_decisions.json 的已确认删除")
         print("-" * 40)
-        print(f"   loop 补充删除: 0 项")
-        return cleaned, []
+        current_sentences = cleaned
+        # review_loop_decisions.json 写在 loop/ 子目录下（与 run_review_loop / assemble 同路径）；
+        # 兼容旧数据曾放在 analysis_dir 根的情况。
+        _loop_cache = detect_agent_dir(analysis_dir) / "review_loop_decisions.json"
+        if not _loop_cache.exists():
+            _loop_cache = analysis_dir / "review_loop_decisions.json"
+        _cached_decisions: list[dict] = []
+        if _loop_cache.exists():
+            try:
+                with open(_loop_cache, encoding="utf-8") as _f:
+                    _cached_decisions = json.load(_f)
+            except Exception as _e:
+                print(f"  [警告] 读取 {_loop_cache.name} 失败: {_e}")
+        # 与 assemble.py 同口径：confirmed 且 action != "report"（✅ 删除；排除 📌 仅标注 / ❌ 驳回）
+        _confirmed_issues = [
+            d["detect"] for d in _cached_decisions
+            if d.get("decision", {}).get("confirmed") is True
+            and d.get("decision", {}).get("action") != "report"
+        ]
+        if _confirmed_issues:
+            current_sentences = apply_deletions_to_sentences(
+                sentences=cleaned,
+                words=words_data,
+                confirmed_issues=_confirmed_issues,
+            )
+            # 落盘，使磁盘与内存一致（供下游 generate_updated_sentences / 报告使用）
+            write_sentences(sentences_path, current_sentences, original=original_sentences)
+            print(f"   已复用缓存确认删除: {len(_confirmed_issues)} 项 → 回写 {sentences_path.name}")
+        else:
+            print(f"   loop 补充删除: 0 项（无可用缓存或缓存无已确认删除）")
+        return current_sentences, _cached_decisions
 
     print("-" * 40)
     print("[步骤5-7] Agent 循环审查")
     print("-" * 40)
 
     # LLM 循环检测（复用 Judge 清洗后的 cleaned 引用，不再回读磁盘）
-    # loop_version 控制审查模式：v1=单检测单验证；v2=按类型拆分的专职 Agent 三分。
-    _loop_path, loop_decisions, current_sentences = run_review_loop(
-        mode=loop_version,
+    # 固定使用 V3：对照原稿找"说错"（检测 + 确认 双 Agent）。
+    _loop_path, loop_decisions, current_sentences = run_agent_review_loop_v3(
         analysis_dir=analysis_dir,
-        loop_dir=loop_dir(analysis_dir),
+        loop_dir=detect_agent_dir(analysis_dir),
         words=words_data,
         model=model,
         use_original_script=use_original_script,
         original_script=original_script,
         sentences=cleaned,
         max_rounds=max_rounds,
-        consecutive_empty_to_exit=2,
+        consecutive_empty_to_exit=1,
         enable_thinking=enable_deepseek_thinking,
-        enable_rule_filter=True,
     )
 
     # 将循环结束后的最终句子列表写回 sentences.txt，使磁盘与内存引用一致
@@ -247,21 +275,6 @@ def _run_assemble_and_report(
     return auto_path, stats
 
 
-def _run_subtitle_generation(
-    analysis_dir: Path, words_json: Path, current_sentences: list[dict],
-) -> None:
-    """步骤9: 生成口误标注字幕（含循环审查信息）。"""
-    print("-" * 40)
-    print(f"[步骤9] 生成口误标注字幕（含循环审查信息）")
-    print("-" * 40)
-
-    annotated_text = generate_annotated_subtitle(analysis_dir, words_json, sentences=current_sentences)
-    subtitle_path = analysis_dir / "口误标注字幕.txt"
-    subtitle_path.write_text(annotated_text, encoding="utf-8")
-    print(f"  口误标注字幕.txt: 已保存")
-    print()
-
-
 def _generate_updated_sentences_phase(
     analysis_dir: Path, words_json: Path, sentences_path: Path,
     current_sentences: list[dict], original_sentences: list[dict],
@@ -294,9 +307,9 @@ def run_pipeline(
     enable_deepseek_thinking: bool = False,
     split_mode: str = "silence",
     use_original_script: bool = False,
-    loop_version: str = "v1",
     max_det_rounds: int = 3,
     max_loop_rounds: int = 5,
+    language: str = "zh-CN",
 ) -> dict:
     """
     运行完整的口误检测流水线（编排各步骤子函数）。
@@ -305,8 +318,7 @@ def run_pipeline(
     步骤1-4: run_detect_judge_loop()  → 机械检测 + 研判 + 应用（多轮收敛）
     步骤5-7: _run_review_loop_phase()  → Agent 循环审查
     步骤8:   _run_assemble_and_report() → auto_selected.json + 报告
-    步骤9:   _run_subtitle_generation() → 口误标注字幕.txt
-    步骤10:  _generate_updated_sentences_phase() → 直接写回 sentences.txt
+    步骤9:  _generate_updated_sentences_phase() → 直接写回 sentences.txt
 
     Args:
         base_dir: 数据根目录 (包含 1_转录/)
@@ -330,7 +342,7 @@ def run_pipeline(
         print("  [预检] 未发现 1_转录 目录，自动从视频转录...")
         print("=" * 60)
         _vid = _find_video(base_dir)
-        transcribe_video(base_dir, video_file=_vid)
+        transcribe_video(base_dir, video_file=_vid, language=language)
         if video_duration == 0.0 and _vid and _vid.exists():
             try:
                 video_duration = get_video_info(str(_vid)).get("duration", 0.0)
@@ -398,7 +410,6 @@ def run_pipeline(
         use_original_script=use_original_script,
         original_script=original_script,
         cleaned=cleaned,
-        loop_version=loop_version,
         enable_deepseek_thinking=enable_deepseek_thinking,
         sentences_path=sentences_path,
         original_sentences=original_sentences,
@@ -441,86 +452,9 @@ def run_pipeline(
     print(f"  耗时: {elapsed:.1f}s")
     print(f"  候选异常: {total_candidates}")
     print(f"  最终删除: {stats['total']} 个 word 索引")
-    print()
-    print(f"  输出文件:")
-    print(f"    {analysis_dir}/auto_selected.json")
-    print(f"    {analysis_dir}/口误分析.md")
-    print(f"    {analysis_dir}/口误标注字幕.txt")
-    _loop_out = analysis_dir / "review_loop_decisions.json"
-    if _loop_out.exists():
-        print(f"    {_loop_out}")
 
     return {
         "candidates": total_candidates,
         "deletes": stats["total"],
         "elapsed": elapsed,
     }
-
-
-# ============================================================
-#  入口（参数全部写死，改这里即可）
-# ============================================================
-
-
-# 让本模块可作为包内模块导入
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-# ── 写死的默认参数 ──
-BASE_DIR = str(ROOT / "2026-07-07_福总")   # 数据根目录（换数据改这一行）
-LOOP_VERSION = "v2"                         # 循环审查模式（v1 默认；v2=专职Agent三分）
-SILENCE_THRESH = 0.9
-# 删除静音时保留的句间呼吸感时长（秒）。
-SILENCE_KEEP_DURATION = 0.5
-MODEL = "deepseek-v4-pro"
-# MODEL = "deepseek-chat"
-VIDEO_DURATION = 0.0
-ENABLE_DEEPSEEK_THINKING = False    # 关闭 DeepSeek 思考模式（加速）
-SPLIT_MODE = "hybrid"         # 按静音 gap 切分
-USE_ORIGINAL_SCRIPT = True     # 启用原稿对照
-SKIP_JUDGE = True
-SKIP_LOOP = False
-SKIP_REVIEW = True
-MAX_DET_ROUNDS = 5
-MAX_LOOP_ROUNDS = 5
-REVIEW_SERVE = True
-
-
-
-def main() -> None:
-    # 参数全部写死，改上方常量即可。
-    # BASE_DIR 相对名（如 2026-07-07_福总）一律相对 ROOT 解析；
-    # 已是绝对路径则原样保留（Path 除法遇绝对路径返回绝对路径）。
-    _base = Path(BASE_DIR)
-    if not _base.is_absolute():
-        _base = ROOT / _base
-    base_dir = str(_base)
-
-    # 1) 跑完整 pipeline 检测
-    run_pipeline(
-        base_dir=base_dir,
-        skip_judge=SKIP_JUDGE,
-        skip_loop=SKIP_LOOP,
-        silence_thresh=SILENCE_THRESH,
-        model=MODEL,
-        video_duration=VIDEO_DURATION,
-        enable_deepseek_thinking=ENABLE_DEEPSEEK_THINKING,
-        split_mode=SPLIT_MODE,
-        use_original_script=USE_ORIGINAL_SCRIPT,
-        loop_version=LOOP_VERSION,
-        max_det_rounds=MAX_DET_ROUNDS,
-        max_loop_rounds=MAX_LOOP_ROUNDS
-    )
-
-    # 2) review 默认开启：检测完直接进入审核（autoselect 静音预选 + 0.1s 呼吸感）
-    if not SKIP_REVIEW:
-        run_review(
-            base_dir=base_dir,
-            silence_gap_threshold=SILENCE_THRESH,
-            silence_keep_duration=SILENCE_KEEP_DURATION,
-            serve=REVIEW_SERVE,
-        )
-
-
-if __name__ == "__main__":
-    main()

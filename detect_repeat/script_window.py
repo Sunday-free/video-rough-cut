@@ -167,3 +167,66 @@ def build_short_org_window(
     if not involved:
         return None
     return build_org_window(script, involved, n_sentences=len(sentences))
+
+
+# finding 中可能携带的 (idx 字段, 文本字段) 对，用于自动抽取原稿定位句。
+_INVOLVED_PAIRS = (
+    ("sent_a_idx", "text_a"),
+    ("sent_b_idx", "text_b"),
+    ("sent_c_idx", "text_c"),
+    ("mid_sent_idx", "mid_text"),
+    ("sent_idx", "text"),
+    ("next_sent_idx", "next_sent_text"),
+)
+
+
+def _involved_from_finding(finding: dict) -> list[tuple[int, str]]:
+    """从 finding 的常见字段自动抽取 (idx, text) 列表，供 build_org_window 定位原稿。"""
+    out: list[tuple[int, str]] = []
+    for idx_key, text_key in _INVOLVED_PAIRS:
+        if idx_key in finding and text_key in finding and finding[text_key]:
+            out.append((finding[idx_key], finding[text_key]))
+    return out
+
+
+def attach_org_window(
+    finding: dict, script: str, sentences: list, short: bool | None = None,
+) -> dict:
+    """给 finding 追加 `org_script_window` 字段（原稿窗口的唯一挂载入口）。
+
+    统一在 detect_loop 里对送研判的 findings 批量调用本函数，各 detect 模块
+    本身不再挂窗口，也不再直接调用 build_org_window / build_short_org_window。
+
+    short:
+      - None（默认）：自动判断——当 finding 只有单个定位句且其文本 ≤2 字
+        （极短孤立句 / 孤立编号）时走 short 逻辑，否则走全窗口。
+      - True：强制用 build_short_org_window（前后长邻居夹窗口，适合极短单句）。
+      - False：强制用 build_org_window 全窗口（句间/跨句重叠类 finding）。
+
+    定位失败（原稿为空 / 文本无匹配）则不挂载字段，保持上游不变。
+    """
+    if not script:
+        return finding
+    if short is None:
+        # 单句 finding（仅 sent_idx、无 next/pair 定位字段）且文本极短(≤2字，含空)
+        # → 自身难定位，走 short（前后长邻居夹窗口）；否则走全窗口。
+        # 注意：极短句 text 可能为空串，不能依赖 _involved_from_finding（空串被
+        # 视为无效定位句而丢弃），故此处直接看 text 长度与是否为单句。
+        _multi = any(
+            k in finding for k in
+            ("next_sent_idx", "sent_a_idx", "sent_b_idx", "sent_c_idx", "mid_sent_idx")
+        )
+        short = (not _multi) and len(finding.get("text", "")) <= 2
+    if short:
+        sent_idx = finding.get("sent_idx")
+        if sent_idx is None:
+            return finding
+        window = build_short_org_window(script, sentences, sent_idx)
+    else:
+        involved = _involved_from_finding(finding)
+        if not involved:
+            return finding
+        window = build_org_window(script, involved, n_sentences=len(sentences))
+    if window:
+        finding["org_script_window"] = window
+    return finding

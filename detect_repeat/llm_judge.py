@@ -10,95 +10,17 @@ llm_judge.py — 步骤4: LLM / Agent 研判层
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ..loop.deepseek_client import deepseek_chat
-from ..loop.llm_parse import parse_json_array
-from ..base.fillers import MODAL_LIST_ZH, MODAL_LIST_ZH_REPEAT
+from speech_error_detector.ai.deepseek_client import deepseek_chat
+from speech_error_detector.ai.llm_parse import parse_json_object
+from speech_error_detector.detect_repeat.judge_prompts import (
+    PROMPTS,
+)
 
-# ============================================================
-#  各检测器的专用 Prompt
-# ============================================================
-
-INTER_JUDGE_PROMPT = """你是口播视频质检专家，对「句间重复」检测结果做最终判定。
-
-## 判定标准
-- 相邻/隔句开头相同且意思完全一致（后句覆盖/完善前句）→ 确认为口误，删前保后
-- 前句的内容被后句的非头部区域大量包含（后句重说了前句的内容，但开头不同）→ 确认为口误，删前保后
-- 只是巧合开头相似但内容走向不同 → 误报，不处理
-
-## 输出格式（严格 JSON 数组）
-[
-  {
-    "finding": "<一句话描述该发现>",
-    "delete_sentences": [<要删除的句子idx列表，如 [19]>],
-    "llm_reason": "<判定理由>"
-  }
-]
-
-如果某条检测是误报（不应删除），则 delete_sentences 为空数组 []。"""
-
-INTRA_JUDGE_PROMPT = """你是口播视频质检专家，对「句内重复」检测结果做最终判定。
-
-## 判定标准
-- 明显的口吃/重说（如"上行上行"、"彻底打开上...彻底打开上"）→ 确认是口误
-- 正常的并列结构（"又快又好"、"情绪面/市场情绪"）→ 误报不处理
-- ⚠️ 语气词/叹词（""" + MODAL_LIST_ZH + """等）的重复（如""" + MODAL_LIST_ZH_REPEAT + """）→ 属于自然语气流露，不算口误，一律判为误报（delete_ranges 为 []），不要删除
-
-## 输出格式（严格 JSON 数组）
-[
-  {
-    "sentence": <句子idx>,
-    "delete_ranges": [[start_word_idx, end_word_idx], ...],  // 要删除的字索引区间；误报则为 []
-    "llm_reason": "<判定理由>"
-  }
-]
-
-每条输入检测对应输出一项。如果确认是口误，delete_ranges 填具体区间；
-如果是误报（正常表达），delete_ranges 为 []。"""
-
-FRAGMENT_JUDGE_PROMPT = """你是口播视频质检专家，对「残句」检测结果做最终判定。
-
-## 判定标准
-- **孤立编号**（单独一个数字如"三"/"二"）：
-  - ⚠️ 先检查上下文：如果全文有其他以中文数字开头的句子（如"一xxx"、"二xxx"、"第三个是..."），且该数字是编号体系的正常序号 → **误报，不删除**
-  - 只有确认是真正孤立的、无意义的重复编号才删除 (mode:"full")
-  
-- 前句卡断被后句接续重说（subtype="残句(被后句接续重说)"）→ 默认保头删尾：
-  - 检测结果已给出 head_text（前句独有头部）与 next_sent_text（后句全文）。
-  - 只要 head_text **不在** next_sent_text 中（头部未被后句覆盖）→ **必须 mode=keep_head**，
-    keep_head 填绝对 word_idx（保留到 head_text 末尾那个词，如 [479, 493]）。
-  - 仅当 head_text **完整包含于** next_sent_text（前句信息后句都有）→ 才允许 mode=full 整句删。
-  - ⚠️ 头部独有论点（如"沪指成功突破4100点强压力位"）一旦整句删会丢失信息，严禁误判 full。
-
-- 极短但语义完整 → 误报
-
-## 输出格式（严格 JSON 数组）
-[
-  {
-    "sentence": <句子idx>,
-    "mode": "<full | keep_head | skip>",   // skip=误报不处理
-    "keep_head": [<保留的头部的起止word_idx>, ...],  // 仅 mode=keep_head 时需要
-    "llm_reason": "<判定理由，说明为什么这样处理>"
-  }
-]
-
-每条输入检测对应输出一项。
-- mode="skip"：误报（如合法序号），不删除
-- mode="full"：整句删除（真正的孤立编号、无独有内容的残句）
-- mode="keep_head"：保头删尾（头部有独有论点，只删尾部重复部分）
-  - ⚠️ keep_head 必须是 **绝对 word_idx**（即 sentences 中该句子范围的起止索引，如 [472, 491]），
-    绝对不能是相对偏移（如 [0, 6] 是错的！）
-  - 必须根据句子范围确定正确的绝对索引值"""
-
-
-PROMPTS = {
-    "inter": INTER_JUDGE_PROMPT,
-    "intra": INTRA_JUDGE_PROMPT,
-    "fragment": FRAGMENT_JUDGE_PROMPT,
-}
 
 
 def _extract_target_indices(detect_results: list[dict], detector_name: str) -> set[int]:
@@ -156,8 +78,8 @@ def build_judge_prompt(
     
     # === 待研判的检测结果 ===
     detect_block = ""
-    for i, item in enumerate(detect_results):
-        detect_block += f"\n### 检测 #{i}\n"
+    for item in detect_results:
+        # 逐条独立调用下每条必为单条，序号无意义；统一不加 "### 检测 #i" 头
         for k, v in item.items():
             if k == "org_script_window":
                 # 原文稿对照片段
@@ -173,13 +95,13 @@ def build_judge_prompt(
 
 ---
 
-## 【待研判的 {detector_name} 检测】共 {len(detect_results)} 条：
+## 【待研判的 {detector_name} 检测】
 
 {detect_block}
 
 ---
 
-请逐条判定上述每条检测。严格按上方格式输出 JSON 数组。"""
+请判定上述检测。严格按上方格式输出一个 JSON 对象。"""
     
     return prompt
 
@@ -207,44 +129,59 @@ def run_llm_judge(
             json.dump([], f)
         return output_path, []
     
-    print(f"   [llm_judge] {detector_name}: 研判 {len(detect_results)} 条检测...")
-    
-    # 构建 Prompt（目标句+上下文）
-    user_prompt = build_judge_prompt(
-        detect_results, sentences, detector_name
-    )
-    system_prompt = PROMPTS.get(detector_name, INTER_JUDGE_PROMPT)
+    print(f"   [llm_judge] {detector_name}: 逐条研判 {len(detect_results)} 条检测（独立调用，避免批量一致性偏置）...")
 
-    # 落盘：每次研判的 user prompt 写到 detect 文件夹，便于核查（区分 round）
+    system_prompt = PROMPTS.get(detector_name, '')
     _round_tag = f"_round{round_idx}" if round_idx is not None else ""
+
+    # ⚠️ 关键修复：逐条独立调用 LLM，而非所有 findings 拼进一个 prompt 批量判定。
+    #    证据：同一 finding 单条输入判对(skip)、6 条批量判错(keep_head)——批量"多数在删"的氛围
+    #    + decision_hint 权威指令导致一致性偏置，把并列误报条也顺手归删。逐条调用从物理上消除该污染。
+    # ⚠️ 并发：线程池 max_workers=4，逐条独立调用 LLM（消除批量一致性偏置），
+    #    按 idx 归位保证 all_decisions 顺序与输入 detect_results 一致。
+    # 先按序构建全部 prompt（用于合并落盘，且供并发调用复用，避免重复构建）
+    round_prompts: list[str] = [
+        build_judge_prompt([det], sentences, detector_name) for det in detect_results
+    ]
+    all_decisions: list[dict] = [{} for _ in range(len(detect_results))]
+
+    def _judge_one(idx: int) -> tuple[int, dict]:
+        try:
+            response_text = deepseek_chat(
+                system=system_prompt,
+                user=round_prompts[idx],
+                model=model,
+                temperature=0.1,
+                enable_thinking=enable_thinking,
+            )
+            dec = parse_json_object(response_text)
+            if not isinstance(dec, dict):
+                dec = {}
+        except Exception as e:
+            print(f"      ⚠️ 第 {idx} 条 LLM 调用失败: {e}, 该条记为空判定")
+            dec = {}
+        return idx, dec
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_judge_one, i) for i in range(len(detect_results))]
+        for fut in futures:
+            idx, dec = fut.result()
+            all_decisions[idx] = dec
+
+    # 落盘：本轮所有逐条 prompt 合并写入一个文件（区分 round），便于整体核查
     prompt_path = output_dir / f"judge_prompt_{detector_name}{_round_tag}.txt"
     try:
         with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(user_prompt)
-        print(f"      📝 user prompt 已写入: {prompt_path.name}")
+            for i, p in enumerate(round_prompts):
+                if i > 0:
+                    f.write("\n\n" + "=" * 50 + f"  检测 #{i}  " + "=" * 50 + "\n\n")
+                f.write(p)
+        print(f"      📝 本轮 {len(round_prompts)} 条 user prompt 已合并写入: {prompt_path.name}")
     except Exception as e:
-        print(f"      ⚠️ user prompt 写入失败: {e}")
+        print(f"      ⚠️ user prompt 合并写入失败: {e}")
 
-    # 调用 LLM
-    try:
-        response_text = deepseek_chat(
-            system=system_prompt,
-            user=user_prompt,
-            model=model,
-            temperature=0.1,
-            enable_thinking=enable_thinking,
-        )
-    except Exception as e:
-        print(f"      ⚠️ LLM 调用失败: {e}, 写入空结果")
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-        return output_path, []
-    
-    # 解析 LLM 判断结果
-    parsed = parse_json_array(response_text)
-    
     # === 合并 detect + decision 为统一格式（对齐 review_loop_decisions.json）===
-    merged = _merge_detect_decision(detect_results, parsed, detector_name)
+    merged = _merge_detect_decision(detect_results, all_decisions, detector_name)
     
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
@@ -293,6 +230,10 @@ def _is_confirmed(decision: dict, detector_name: str) -> bool:
     elif detector_name == "fragment":
         mode = decision.get("mode", "")
         return mode not in ("skip", None, "")
+    elif detector_name == "partial":
+        mode = decision.get("mode", "")
+        # partial 仅产出 keep_head / full（部分或整句删除）；skip 视为误报拒绝
+        return mode in ("keep_head", "full")
     else:
         return True
 
@@ -304,7 +245,7 @@ def _is_confirmed(decision: dict, detector_name: str) -> bool:
 def run_all_judges(
     analysis_dir: Path,
     sentences: list[dict],
-    detect_data: dict[str, list[dict]] | None = None,
+    detect_data: dict[str, list[dict]],
     model: str = "deepseek-v4-pro",
     enable_thinking: bool | None = None,
     round_idx: int | None = None,
@@ -321,18 +262,9 @@ def run_all_judges(
     """
     all_results = {}
     
-    for det_name in ["inter", "intra", "fragment"]:
+    for det_name in ["inter", "intra", "fragment", "partial"]:
         # 优先使用内存传入的检测数据
-        if detect_data and det_name in detect_data:
-            det_results = detect_data[det_name]
-        else:
-            # Fallback：从磁盘读取已有文件
-            det_path = analysis_dir / f"detect_{det_name}.json"
-            if not det_path.exists():
-                print(f"   [llm_judge] {det_name}: 检测数据不存在，跳过")
-                continue
-            with open(det_path, "r", encoding="utf-8") as f:
-                det_results = json.load(f)
+        det_results = detect_data[det_name]
         
         if not det_results:
             print(f"   [llm_judge] {det_name}: 无检测项，跳过")

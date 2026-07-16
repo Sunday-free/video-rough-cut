@@ -24,9 +24,8 @@ dirs = [
     {"dir": "2026-07-07_福总", "language": "zh-CN"},
     {"dir": "2026-07-07_红姐", "language": "zh-CN"},
     {"dir": "2026-07-07_man姐", "language": "zh-CN"},
-    {"dir": "2026-07-07_man姐-粤语", "language": "yue-CN"},
 ]
-RUN_INDEX = 1   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
+RUN_INDEX = 2   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
 SILENCE_THRESH = 0.9
 # 删除静音时保留的句间呼吸感时长（秒）。
 SILENCE_KEEP_DURATION = 0.5

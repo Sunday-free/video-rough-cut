@@ -146,18 +146,16 @@ def _entry_indices(entry: dict) -> tuple[str | None, list[tuple[int, int]]]:
       - intra_repeat             → 句内重复
       - fragment                 → 残句
       - partial（保头删尾）       → 句间重复（区间算法与 fragment 同构，但 tab 归「句间重复」）
-      - misread / off_topic      → 残句（V3 读稿错误：增读/跑题，整句删）
       - misread / resay          → 残句（V3 读稿错误：残句重说，整句删）
 
-    即：partial → 句间重复；resay / off_topic → 残句。前端只需 inter_repeat / fragment 两类即可承载。
+    即：partial → 句间重复；resay → 残句。前端只需 inter_repeat / fragment 两类即可承载。
     """
     det = entry.get("detect", entry) or {}
     dec = entry.get("decision", {}) or {}
     typ = det.get("type") or det.get("dimension")
-    sub = det.get("subtype") or ""
 
     # V3 读稿错误检测：dimension=misread，归并到独立「误读(misread)」tab。
-    #   off_topic（增读/跑题）/ resay（残句重说）均为整句删 → 用整句 range。
+    #   resay（残句重说）整句删 → 用整句 range。
     if typ == "misread":
         r = _parse_range(det.get("range"))
         return "misread", ([r] if r else [])
@@ -247,7 +245,7 @@ def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
                 applied.append(e)  # 包含 ✅确认/📌仅标注/❌驳回，全部在页面标注
 
     # 按优先级分类后逐类标注（先精确/具体，first-wins）
-    # 归并映射在 _entry_indices 内完成：partial→句间重复；misread(off_topic/resay)→误读。
+    # 归并映射在 _entry_indices 内完成：partial→句间重复；misread(resay)→误读。
     buckets: dict[str, list[list[tuple[int, int]]]] = {
         "intra_repeat": [], "fragment": [], "inter_repeat": [], "misread": [],
     }

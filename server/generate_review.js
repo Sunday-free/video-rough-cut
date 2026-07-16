@@ -41,7 +41,7 @@ if (fs.existsSync(autoSelectedFile)) {
   console.log('AI 预选:', autoSelected.length, '个元素');
 }
 
-// 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment），由 review_entry.py 生成
+// 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment/misread），由 review_entry.py 生成
 let wordCategories = {};
 if (fs.existsSync(categoriesFile)) {
   try {
@@ -897,7 +897,7 @@ const html = `<!DOCTYPE html>
     const words = ${JSON.stringify(words)};
     const autoSelected = new Set(${JSON.stringify(autoSelected)});
     const selected = new Set(autoSelected);
-    // 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment），由 review_entry.py 生成
+    // 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment/misread），由 review_entry.py 生成
     const wordCategories = ${JSON.stringify(wordCategories)};
 
     // 自动保存状态（必须在 rebuildSkipIntervals 之前声明，否则 TDZ）

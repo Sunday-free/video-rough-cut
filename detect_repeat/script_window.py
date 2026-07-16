@@ -8,6 +8,25 @@ script_window.py — 原文稿窗口匹配与截取
 import difflib
 
 
+_PUNCT = set("，。！？、；：\"'（）…— \t\n\r")
+
+
+def _depunctuate(s: str) -> str:
+    """去除标点/空白，仅保留语义字符。"""
+    return "".join(ch for ch in s if ch not in _PUNCT)
+
+
+def _depunctuate_map(s: str) -> tuple[str, list[int]]:
+    """返回 (去标点字符串, mapping)，mapping[i] 为 clean[i] 在原稿中的偏移。"""
+    out: list[str] = []
+    mapping: list[int] = []
+    for i, ch in enumerate(s):
+        if ch not in _PUNCT:
+            out.append(ch)
+            mapping.append(i)
+    return "".join(out), mapping
+
+
 def match_script_position(
     script: str,
     text: str,
@@ -31,28 +50,71 @@ def match_script_position(
         candidates.append(pos)
         pos = script.find(text, pos + 1)
 
-    # 2) 去标点再匹配（应对 ASR/口播稿标点差异）
+    # 2) 候选去标点再匹配（应对 ASR/口播稿标点差异）
     if not candidates:
-        clean = text.strip('，。！？、；：""\'\'（）…— \t\n\r')
-        if clean and clean != text:
-            p = script.find(clean)
-            while p >= 0:
-                candidates.append(p)
-                p = script.find(clean, p + 1)
+        clean = _depunctuate(text)
+        p = script.find(clean)
+        while p >= 0:
+            candidates.append(p)
+            p = script.find(clean, p + 1)
 
-    # 3) 模糊匹配：用 difflib 收集所有匹配块
+    # 2.5) 双向去标点匹配：原稿也去标点后再找，应对【原稿内部标点差异】
+    #      （如原稿「二、人工智能、新能源车」vs 候选「二人工智能新能源车」——
+    #      仅候选去标点时因内部 、 对不上会退化成模糊匹配、从中间开始，导致定位右移）。
+    if not candidates:
+        clean = _depunctuate(text)
+        if clean:
+            clean_script, mapping = _depunctuate_map(script)
+            p = clean_script.find(clean)
+            while p >= 0:
+                orig = mapping[p] if p < len(mapping) else -1
+                if orig >= 0:
+                    candidates.append(orig)
+                p = clean_script.find(clean, p + 1)
+
+    # 2.6) 候选【前缀】匹配：口播/残句常与原文稿仅【前缀】一致（后半改写或截断，
+    #      如候选「…也是接下来的」vs 原稿「…也是接下来我们要…」），整串匹配不到。
+    #      用去标点后的候选前缀在原稿去标点文本中定位，取最长可匹配前缀 → 拿到候选句首。
+    if not candidates:
+        clean = _depunctuate(text)
+        if clean and len(clean) >= 6:
+            clean_script, mapping = _depunctuate_map(script)
+            for L in range(len(clean), 5, -1):
+                pref = clean[:L]
+                p = clean_script.find(pref)
+                if p >= 0:
+                    while p >= 0:
+                        orig = mapping[p] if p < len(mapping) else -1
+                        if orig >= 0:
+                            candidates.append(orig)
+                        p = clean_script.find(pref, p + 1)
+                    break
+
+    # 3) 模糊匹配：用 difflib 找「最大连续匹配块」作为锚点
+    #    口语与原稿有差异时长句会散出多块，必须取【最大块】而非「最接近估算点」，
+    #    否则会误锚到凑巧靠近的无关片段，导致窗口左/右边界错位（左邻居被截断）。
     if not candidates:
         s = difflib.SequenceMatcher(None, script, text)
         blocks = s.get_matching_blocks()
-        total_matched = sum(b.size for b in blocks)
-        if total_matched < len(text) * min_ratio:
+        good = [b for b in blocks if b.size >= max(2, int(len(text) * min_ratio))]
+        if not good:
             return -1
-        candidates = [b.a for b in blocks if b.size > 0]
+        # 顺序约束：优先满足「后句必在前句之后」（仅当存在满足约束的块时生效）
+        if lower is not None:
+            after = [b for b in good if b.a >= lower]
+            if after:
+                good = after
+        # 主选最大连续匹配块；并列时取最接近 expected_pos 者
+        best = max(
+            good,
+            key=lambda b: (b.size, -abs(b.a - expected_pos) if expected_pos is not None else 0),
+        )
+        return best.a
 
     if not candidates:
         return -1
 
-    # 顺序约束：优先满足「在后句之前已定位句之后」
+    # 顺序约束：优先满足「在后句之前已定位句之后」（精确/去标点匹配走此路径）
     if lower is not None:
         after = [p for p in candidates if p >= lower]
         if after:
@@ -69,6 +131,8 @@ def build_org_window(
     script: str,
     involved: list[tuple[int, str]],
     n_sentences: int | None = None,
+    max_window: int = 100,
+    focus_idx: int | None = None,
 ) -> str | None:
     """构建原文稿对照片段（从匹配位向两侧对齐标点边界，限制扩展范围与总长，合并覆盖所有匹配位）。
 
@@ -76,58 +140,112 @@ def build_org_window(
         (idx/总句数 × 原稿长度)，在文本重复/模糊多匹配时就近消歧；并按句序号
         排序逐句定位，使后句的匹配不得早于前句结束（顺序约束）。
     """
-    positions: list[int] = []
     # 按句序号排序，利用句子在原稿中的先后顺序逐句定位（后句必在前句之后）
     lower = None
-    matched: list[tuple[int, str, int]] = []  # (idx, text, pos)
+    matched: list[tuple[int, str, int, bool]] = []  # (idx, text, pos, is_real)
     for idx, text in sorted(involved, key=lambda x: x[0]):
         expected = (idx / n_sentences * len(script)) if n_sentences else None
         pos = match_script_position(script, text, expected_pos=expected, lower=lower)
         if pos >= 0:
-            matched.append((idx, text, pos))
+            matched.append((idx, text, pos, True))
             lower = pos + len(text)  # 下一句不得早于本句结束
+        elif expected is not None and expected > 0:
+            # 文本匹配失败（ASR 噪音/口误），先用 idx 估算原稿位置占位；
+            # 真正定位交给下方 focus 兜底：用前后已匹配邻居句插值。
+            est = int(expected)
+            if lower is not None and est < lower:
+                est = lower  # 不早于已定位的前句
+            matched.append((idx, text, est, False))
+            lower = est + len(text)
     if not matched:
         return None
 
-    min_pos = min(p for _, _, p in matched)
-    max_pos = max(p for _, _, p in matched)
+    min_pos = min(p for _, _, p, _ in matched)
+    max_pos = max(p for _, _, p, _ in matched)
 
-    # 从匹配位置本身向两侧对齐标点边界（而非从 ctx 切点，避免无界扩展）
-    # 对齐边界只用句末标点（不含逗号）——否则遇到逗号即停，截不出完整句子；
-    # 去掉逗号后窗口可跨越逗号、覆盖整句，给 LLM 更充分的原稿上下文。
-    # 注意：右对齐必须从「最右匹配句起点 max_pos」向前找第一个句号，而不能用
-    # pos+len(text) 这类易越界的值——一旦越过句号，就会从句号之后继续扫到更后文。
+    # ── 聚焦位置（问题句中心）────────────────────────────────────────────
+    # 优先用 focus_idx 对应句的直接匹配位置；若问题句在原稿匹配不到
+    # （ASR 噪音/口误），则用其前后【已成功匹配】的邻居句位置插值估计——
+    # 即「问题句定位不到原稿 → 由前后句定位」，最终仍保证它落在窗口中间。
+    # 缺省（未指定 focus_idx，如多句比对）取匹配跨度的几何中点。
+    focus = None
+    p_start: int = 0
+    p_end: int = len(script)
+    prob_len = 0
+    if focus_idx is not None:
+        real_left = real_right = None
+        for idx, text, pos, is_real in matched:
+            if idx == focus_idx:
+                if is_real:
+                    p_start, p_end = pos, pos + len(text)
+                    focus = (p_start + p_end) // 2
+                prob_len = len(text)
+            elif is_real:
+                if idx < focus_idx and (real_left is None or idx > real_left[0]):
+                    real_left = (idx, pos, text)
+                elif idx > focus_idx and (real_right is None or idx < real_right[0]):
+                    real_right = (idx, pos, text)
+        if focus is None:
+            # 问题句未直接匹配：用前后已匹配邻居句位置插值估计。
+            # 注意用「左邻居句尾 → 右邻居句首」之间插值（而非两句首），
+            # 否则长左邻居会把估计点拉进其内部，导致问题句不居中。
+            if real_left and real_right:
+                li, lp, lt = real_left
+                ri, rp, _ = real_right
+                left_end = lp + len(lt)
+                ratio = (focus_idx - li) / (ri - li)
+                fpos = int(left_end + (rp - left_end) * ratio)
+            elif real_left:
+                fpos = real_left[1] + len(real_left[2])
+            elif real_right:
+                fpos = real_right[1]
+            else:
+                fpos = (min_pos + max_pos) // 2
+            p_start, p_end = fpos, fpos + max(prob_len, 1)
+            focus = (p_start + p_end) // 2
+    if focus is None:
+        focus = (min_pos + max_pos) // 2
+
+    # 是否需要对「问题句本体」做保护（不切入本句）：仅当明确传了 focus_idx 时。
+    # focus_idx=None（如多句比对 / build_short_org_window 借邻居夹窗）时，
+    # p_start/p_end 只是 0/len(script) 的占位默认值，绝不能据此钳制。
+    protect = focus_idx is not None
+
+    # ── 以问题句为中心、左右均衡截取 ─────────────────────────────────────
+    # 窗口以 focus 为中心各取半窗（half = max_window//2），并向句末标点对齐；
+    # 对齐只允许在「半窗范围内」扩展、绝不越过 focus±half，从而保证问题句居中；
+    # 最后强制平衡（两侧扩展等长、上限 half），左右用「…」收尾。
     _SENT_END = set("。！？")
-    MAX_ALIGN = 80   # 单侧最多向边界扩展的字符数
-    MAX_WINDOW = 200 # 窗口总长度硬上限
+    half = max_window // 2
 
-    # 向后对齐：从 min_pos 向前找最近的标点边界
-    start = min_pos
-    while start > 0 and start > min_pos - MAX_ALIGN and script[start - 1] not in _SENT_END:
-        start -= 1
+    # 左边界：以 focus-half 为基准，向左（最多一整个 half）对齐到最近句末标点；
+    # 若半窗内无句末，则直接截断在 focus-half（不越过，保证居中）。
+    lo = max(0, focus - 2 * half)
+    ls = focus - half
+    while ls > lo and script[ls - 1] not in _SENT_END:
+        ls -= 1
+    start = ls if (ls > lo and script[ls - 1] in _SENT_END) else focus - half
 
-    # 向前对齐：从 max_pos 向后找最近的句末标点（即最右匹配句自身的句号）
-    end = max_pos
-    while end < len(script) and end < max_pos + MAX_ALIGN and script[end] not in _SENT_END:
-        end += 1
-    if end < len(script) and script[end] in _SENT_END:
-        end += 1  # 包含句末标点
+    # 右边界：以 focus+half 为基准，向右（最多一整个 half）对齐到最近句末标点（含该标点）；
+    # 若半窗内无句末，则直接截断在 focus+half。
+    hi = min(len(script), focus + 2 * half)
+    rs = focus + half
+    while rs < hi and script[rs] not in _SENT_END:
+        rs += 1
+    end = (rs + 1) if (rs < len(script) and script[rs] in _SENT_END) else focus + half
 
-    # 右侧尾随上下文：句号之后若立即收尾，LLM 看不到片段之后的叙事延续。
-    # 再向后补充一小段（到下个句号为止，最多 RIGHT_TRAIL 字），让窗口右缘更自然；
-    # 仍以 MAX_WINDOW 封顶，不会一路涨回更后的段落（如「赚七成收益」）。
-    RIGHT_TRAIL = 45
-    trail = end
-    while trail < len(script) and trail < end + RIGHT_TRAIL and script[trail] not in _SENT_END:
-        trail += 1
-    if trail < len(script) and script[trail] in _SENT_END:
-        trail += 1
-    if trail - start <= MAX_WINDOW:
-        end = trail
-
-    # 硬上限：超出则截断
-    if end - start > MAX_WINDOW:
-        end = start + MAX_WINDOW
+    # 平衡 + 保护问题句完整可见：窗口必须覆盖整个 [p_start, p_end]（问题句本体），
+    # 但两侧扩展以较长侧为基准、上限 half，保证问题句居中、左右均衡。
+    left_ext = focus - start
+    right_ext = end - focus
+    target = min(max(left_ext, right_ext), half)
+    ns = max(0, focus - target)
+    if protect and ns > p_start:           # 不得切入问题句左侧
+        ns = p_start
+    ne = min(len(script), focus + target)
+    if protect and ne < p_end:             # 不得切入问题句右侧
+        ne = p_end
+    start, end = ns, ne
 
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(script) else ""
@@ -189,10 +307,21 @@ def _involved_from_finding(finding: dict) -> list[tuple[int, str]]:
     return out
 
 
-def attach_org_window(
-    finding: dict, script: str, sentences: list, short: bool | None = None,
-) -> dict:
-    """给 finding 追加 `org_script_window` 字段（原稿窗口的唯一挂载入口）。
+def _strip_nl(s: str | None) -> str | None:
+    """去掉字符串中的换行符，None 透传。"""
+    if s is None:
+        return None
+    return s.replace("\n", "").replace("\r", "")
+
+
+def get_org_script_window(
+    script: str,
+    sentences: list,
+    finding: dict,
+    short: bool | None = None,
+    focus_idx: int | None = None,
+) -> str | None:
+    """计算原稿窗口并直接返回（原稿窗口的唯一入口）。
 
     统一在 detect_loop 里对送研判的 findings 批量调用本函数，各 detect 模块
     本身不再挂窗口，也不再直接调用 build_org_window / build_short_org_window。
@@ -203,15 +332,12 @@ def attach_org_window(
       - True：强制用 build_short_org_window（前后长邻居夹窗口，适合极短单句）。
       - False：强制用 build_org_window 全窗口（句间/跨句重叠类 finding）。
 
-    定位失败（原稿为空 / 文本无匹配）则不挂载字段，保持上游不变。
+    max_window 内部自适应：至少 100，如果定位句较长则按 2 倍扩展。
+    定位失败（原稿为空 / 文本无匹配）返回 None。
     """
     if not script:
-        return finding
+        return None
     if short is None:
-        # 单句 finding（仅 sent_idx、无 next/pair 定位字段）且文本极短(≤2字，含空)
-        # → 自身难定位，走 short（前后长邻居夹窗口）；否则走全窗口。
-        # 注意：极短句 text 可能为空串，不能依赖 _involved_from_finding（空串被
-        # 视为无效定位句而丢弃），故此处直接看 text 长度与是否为单句。
         _multi = any(
             k in finding for k in
             ("next_sent_idx", "sent_a_idx", "sent_b_idx", "sent_c_idx", "mid_sent_idx")
@@ -220,13 +346,39 @@ def attach_org_window(
     if short:
         sent_idx = finding.get("sent_idx")
         if sent_idx is None:
-            return finding
-        window = build_short_org_window(script, sentences, sent_idx)
+            return None
+        return _strip_nl(build_short_org_window(script, sentences, sent_idx))
     else:
         involved = _involved_from_finding(finding)
         if not involved:
-            return finding
-        window = build_org_window(script, involved, n_sentences=len(sentences))
-    if window:
-        finding["org_script_window"] = window
-    return finding
+            return None
+        # 补充前后邻居句辅助定位：当前句文本可能为 ASR 噪音无法匹配原稿，
+        # 但邻居句可以匹配，通过邻居句在原稿中的位置间接定位当前句。
+        involve_set = {i for i, _ in involved}
+        sent_idx_map = {s["idx"]: (s.get("text", "") or "").strip() for s in sentences}
+        _sorted = sorted(involved, key=lambda x: x[0])
+        min_i, max_i = _sorted[0][0], _sorted[-1][0]
+        max_sid = max(sent_idx_map.keys()) if sent_idx_map else max_i
+        # 向左取最近的非空邻居（>2字）
+        i = min_i - 1
+        while i >= 0:
+            t = sent_idx_map.get(i, "")
+            if t and i not in involve_set and len(t) > 2:
+                involved.append((i, t))
+                involve_set.add(i)
+                break
+            i -= 1
+        # 向右取最近的非空邻居（>2字）
+        i = max_i + 1
+        while i <= max_sid:
+            t = sent_idx_map.get(i, "")
+            if t and i not in involve_set and len(t) > 2:
+                involved.append((i, t))
+                involve_set.add(i)
+                break
+            i += 1
+        dyn_max = max(50, max(len(t) for _, t in involved) * 2)
+        return _strip_nl(build_org_window(
+            script, involved, n_sentences=len(sentences), max_window=dyn_max,
+            focus_idx=focus_idx,
+        ))

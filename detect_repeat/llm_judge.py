@@ -40,23 +40,39 @@ def build_judge_prompt(
     detect_results: list[dict],
     sentences: list[dict],
     detector_name: str,
-    context_radius: int = 2,
+    context_radius: int = 3,
 ) -> str:
     """构建 LLM 研判 Prompt（包含目标句 + 上下文；策略 6 的 finding 自带原文稿窗口）"""
     
-    # 建立 idx → sentence 索引
+    # 建立 idx → sentence 索引（仅非空句）
     idx_map = {s["idx"]: s for s in sentences}
+    nonempty_indices = sorted(i for i, s in idx_map.items() if s.get("text", "").strip())
     
     # 提取所有待研判句子的 idx
     target_indices = _extract_target_indices(detect_results, detector_name)
     
-    # 圈定上下文范围：目标句 ±context_radius
+    # 圈定上下文范围：每个目标句 ±context_radius 个非空可见句（跳过空句，左右独立扫描）
+    min_idx = min(nonempty_indices) if nonempty_indices else 0
+    max_idx = max(nonempty_indices) if nonempty_indices else 0
     context_indices: set[int] = set()
     for ti in target_indices:
-        for offset in range(-context_radius, context_radius + 1):
-            neighbor = ti + offset
-            if neighbor in idx_map:
-                context_indices.add(neighbor)
+        context_indices.add(ti)
+        # 向左扫描：跳过空句，收集满 context_radius 个非空句
+        i = ti - 1
+        left_count = 0
+        while left_count < context_radius and i >= min_idx:
+            if idx_map.get(i, {}).get("text", "").strip():
+                context_indices.add(i)
+                left_count += 1
+            i -= 1
+        # 向右扫描：跳过空句，收集满 context_radius 个非空句
+        i = ti + 1
+        right_count = 0
+        while right_count < context_radius and i <= max_idx:
+            if idx_map.get(i, {}).get("text", "").strip():
+                context_indices.add(i)
+                right_count += 1
+            i += 1
     
     # 合并目标句和上下文，按 idx 排序
     all_indices = target_indices | context_indices
@@ -141,7 +157,7 @@ def run_llm_judge(
     #    按 idx 归位保证 all_decisions 顺序与输入 detect_results 一致。
     # 先按序构建全部 prompt（用于合并落盘，且供并发调用复用，避免重复构建）
     round_prompts: list[str] = [
-        build_judge_prompt([det], sentences, detector_name) for det in detect_results
+        build_judge_prompt([det], sentences, detector_name, 3) for det in detect_results
     ]
     all_decisions: list[dict] = [{} for _ in range(len(detect_results))]
 

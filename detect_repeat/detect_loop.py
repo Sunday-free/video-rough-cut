@@ -17,7 +17,7 @@ from speech_error_detector.detect_repeat.detect_intra import run_detect_intra
 from speech_error_detector.detect_repeat.detect_fragment import run_detect_fragment
 from speech_error_detector.detect_repeat.detect_partial import run_detect_partial
 from speech_error_detector.detect_repeat.llm_judge import run_all_judges
-from speech_error_detector.detect_repeat.script_window import attach_org_window
+from speech_error_detector.detect_repeat.script_window import get_org_script_window
 from speech_error_detector.detect_repeat.script_faithful import filter_repeat_in_org_window
 from speech_error_detector.utils.sentence_io import write_sentences
 from speech_error_detector.utils.paths import detect_repeat_dir
@@ -395,8 +395,8 @@ def _prepare_findings_for_judge(
     仅「头部/尾部重叠」可能是前轮删中间句后碰出的假重叠）。
 
     同时：
-    - attach_org_window：只对未跳过（去重/抑制）的 finding 处理，避免在各 detect 模块
-      里分散重复计算；short=None 由 attach_org_window 自动判断（极短单句走前后长邻居
+    - get_org_script_window：只对未跳过（去重/抑制）的 finding 处理，避免在各 detect 模块
+      里分散重复计算；short=None 由 get_org_script_window 自动判断（极短单句走前后长邻居
       夹窗口）。
     - filter_repeat_in_org_window：原稿窗口内重复（忠于原稿/排比）的重复（序号枚举、并列排比）排除，不送研判；数字对齐
       用增强版 normalize_numerals_full；fragment/inter 用边界感知计数，解决 false-start
@@ -442,11 +442,13 @@ def _prepare_findings_for_judge(
 
     # 统一挂载原稿对照片段（org_script_window）：只对未跳过（去重/抑制）的
     # finding 处理，避免在各 detect 模块里分散重复计算。short=None 由
-    # attach_org_window 自动判断（极短单句走前后长邻居夹窗口）。
+    # get_org_script_window 自动判断（极短单句走前后长邻居夹窗口）。
     for _cat_findings in findings.values():
         for _f in _cat_findings:
             if not _f.get("skip"):
-                attach_org_window(_f, original_script, cur_sentences)
+                _f["org_script_window"] = get_org_script_window(
+                    original_script, cur_sentences, _f,
+                )
 
     # 原稿窗口内重复排除：忠于原稿/排比的重复（序号枚举、并列排比）排除，不送研判
     # 数字对齐用增强版 normalize_numerals_full；fragment/inter 用边界感知计数，

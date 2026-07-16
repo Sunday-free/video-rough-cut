@@ -647,10 +647,14 @@ def _build_loop_section(decisions: list) -> str:
         for iss in items:
             detect = iss.get("detect", {})
             decision = iss.get("decision", {})
-            dim = dim_label.get(detect.get("dimension", ""), detect.get("dimension", "?"))
-            sev = sev_label.get(detect.get("severity", ""), "")
-            sid = detect.get("sentence_idx", "?")
-            err_text = (detect.get("error_text") or detect.get("delete_text", ""))
+            # 兼容 _make_decision_obj 的字段名（type/sent_idx/decision_hint）和旧格式
+            dim_raw = detect.get("dimension") or detect.get("type", "?")
+            dim = dim_label.get(dim_raw, dim_raw)
+            sev_raw = detect.get("severity", "")
+            sev = sev_label.get(sev_raw, "")
+            sid = detect.get("sentence_idx") or detect.get("sent_idx", "?")
+            err_text = (detect.get("error_text") or detect.get("decision_hint")
+                        or detect.get("text", ""))
             reason = (decision.get("reason") or decision.get("llm_reason", ""))
             if _is_delete(iss):
                 mark, label = "✅", "确认理由"
@@ -662,6 +666,9 @@ def _build_loop_section(decisions: list) -> str:
             section += f"- {mark} **[{sev}] [{dim}] 句{sid}** 「{err_text}」\n"
             if reason:
                 section += f"  - {label}: {reason}\n"
+            applied_text = decision.get("applied_text", "")
+            if applied_text:
+                section += f"  - 实际删除: 「{applied_text}」\n"
 
         section += "\n"
 

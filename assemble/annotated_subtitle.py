@@ -229,7 +229,7 @@ def generate_annotated_subtitle(
                 dim = dim_label.get(detect.get("dimension", ""), detect.get("dimension", "?"))
                 sev = severity_map.get(detect.get("severity", ""), "")
                 sid = detect.get("sentence_idx", "?")
-                err_text = (detect.get("error_text") or detect.get("delete_text", ""))[:50]
+                err_text = (detect.get("error_text") or "")[:50]
                 reason = decision.get("reason", "")[:60]
                 
                 tag = f"[{sev}] " if sev else ""

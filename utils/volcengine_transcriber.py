@@ -55,6 +55,52 @@ def get_api_key() -> str:
     return key
 
 
+# ============================================================
+#  ASR 误识别修正映射表（hard code）
+#  格式: "ASR 给出的错误词" → "期望的正确词"
+#  后续如需新增，直接在这里加一行即可。
+# ============================================================
+_ASR_FIX_MAP: dict[str, str] = {
+    "ming": "man",   # 火山 ASR 常将「man」误识别为「ming」
+}
+
+
+def _fix_asr_misrecognition(query_resp: dict, fix_map: dict[str, str] | None = None) -> None:
+    """通用 ASR 误识别修正：根据 fix_map 对 utterances text/words 做就地替换。
+
+    fix_map 格式: {"错误词": "正确词", ...}，默认使用模块级 _ASR_FIX_MAP。
+    匹配为整词边界（\\b），不区分大小写；词级别 words 修正时保持原大小写风格。
+    """
+    import re
+    if fix_map is None:
+        fix_map = _ASR_FIX_MAP
+    if not fix_map:
+        return
+
+    # 预编译正则 + 目标映射
+    patterns: list[tuple[re.Pattern, str]] = []
+    for wrong, correct in fix_map.items():
+        patterns.append((re.compile(rf"\b{re.escape(wrong)}\b", re.IGNORECASE), correct))
+
+    for utt in query_resp.get("result", {}).get("utterances", []):
+        txt = utt.get("text", "")
+        if not txt:
+            continue
+        # 整句级别替换
+        for pat, correct in patterns:
+            txt = pat.sub(correct, txt)
+        utt["text"] = txt
+
+        # 词级别 words
+        words = utt.get("words", [])
+        for w in words:
+            w_text = w.get("text", "")
+            for pat, correct in patterns:
+                if pat.fullmatch(w_text):
+                    w["text"] = correct[0].upper() + correct[1:] if w_text and w_text[0].isupper() else correct
+                    break
+
+
 def transcribe(
     audio_path: Path,
     output_dir: Path,
@@ -187,6 +233,9 @@ def transcribe(
             utterances = query_resp["utterances"]
 
         if utterances and len(utterances) > 0:
+            # Hard code: 火山 ASR 识别错误修复
+            _fix_asr_misrecognition(query_resp)
+
             # 保存结果
             with open(result_json, "w", encoding="utf-8") as f:
                 json.dump(query_resp, f, ensure_ascii=False, indent=2)

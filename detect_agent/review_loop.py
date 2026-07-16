@@ -8,10 +8,9 @@
 v1/v2 已迁移到其他工程，此处只保留 V3 需要的逻辑，去掉 v1/v2 专用分支
 （type_filter、批量 verify、机械 seed 补召回、inter/intra/fragment 子类型）。
 
-V3 检测/确认专门对照原稿找"说错"（off_topic / resay，不含 misread_content）：
-  - off_topic  增读/跑题：原稿无对应、非过渡的废话/脱稿/长串口头禅 → 整段删
+V3 检测/确认专门对照原稿找"说错"（仅 resay：
   - resay      残句·重说：语义同但措辞异的重说（删前保后）→ 整句删
-  - misread 维度：off_topic / resay 均整句删（mode=full，action="delete"）
+  - misread 维度：resay 整句删（mode=full，action="delete"）
   - 所有决策统一落 review_loop_decisions.json（含 confirmed + action）
 
 循环：detect_agent(识别错误) → confirm_agent(逐条确认) → apply(应用) → 下一轮
@@ -21,6 +20,7 @@ V3 检测/确认专门对照原稿找"说错"（off_topic / resay，不含 misre
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -31,9 +31,10 @@ from speech_error_detector.ai.llm_parse import parse_json_object
 # 通用工具（V3 的 detect/apply 依赖），来自同包 agent_apply：
 from speech_error_detector.detect_agent.agent_apply import (
     apply_deletions_to_sentences,
-    build_processed_summary,
+    build_rejected_summary,
     is_modal_only_delete,
 )
+from speech_error_detector.utils.sentence_io import write_sentences
 
 from speech_error_detector.detect_agent.prompts import (
     DETECT_V3_SYSTEM_PROMPT,
@@ -62,31 +63,8 @@ def _log_prompt(loop_dir: Path, round_num: int, stage: str, prompt_text: str) ->
 
 
 # ============================================================
-#  辅助：纯语气词 / 单字重复 / 自检撤回 过滤
+#  辅助：纯语气词 过滤
 # ============================================================
-
-def _is_single_char_repeat(iss: dict) -> bool:
-    """单字重复判定：重复类 issue 且其删除文本仅 1 个字符（如「是」单字赘余）。
-
-    V3 维度为 misread（off_topic/resay），本判定对其恒为 False；保留以兼容 detect 残留。
-    """
-    dim = iss.get("dimension", "")
-    if dim not in ("intra_repeat", "inter_repeat"):
-        return False
-    dt = (iss.get("delete_text") or "").strip()
-    return len(dt) == 1
-
-
-def _is_self_retract(iss: dict) -> bool:
-    """自检撤回判定：detect 输出的 description 为「不报」等自我否定短语时，
-    说明模型自己认为该候选不该报。进 verify 也只是被驳回，纯属浪费 LLM 调用并污染
-    决策日志，因此在 detect 出口直接丢弃，不进 verify、不进 decisions 日志。
-    """
-    desc = (iss.get("description") or "").strip().rstrip("。！？.!?；;")
-    return desc in (
-        "不报", "不报告", "无需报", "无需报告",
-        "不应报", "不应报告", "不处理", "不建议报",
-    )
 
 
 # ============================================================
@@ -101,10 +79,7 @@ def _run_detect(
     effective_script: str,
     all_decisions: list[dict],
     enable_thinking: bool = False,
-    system_prompt: str = DETECT_V3_SYSTEM_PROMPT,
-    build_prompt_fn=build_detect_v3_prompt,
     stage: str = "detect",
-    log_prompt: bool = True,
 ) -> list[dict] | None:
     """执行一轮 Detect：构建 prompt、记录日志、调用 LLM、解析、过滤纯语气词删除项。
 
@@ -117,21 +92,20 @@ def _run_detect(
         - 成功: 过滤后的 new_issues（list[dict]）
         - LLM 调用失败: None（调用方据此 break 退出循环）
     """
-    processed_summary = build_processed_summary(all_decisions)
-    detect_prompt = build_prompt_fn(
+    rejected_summary = build_rejected_summary(all_decisions)
+    detect_prompt = build_detect_v3_prompt(
         sentences=current_sentences,
         original_script=effective_script,
-        processed_summary=processed_summary,
+        rejected_summary=rejected_summary,
     )
-    if log_prompt:
-        _log_prompt(loop_dir, round_num, stage, detect_prompt)
+    _log_prompt(loop_dir, round_num, stage, detect_prompt)
 
     t0 = time.time()
     detect_response = None
     for attempt in range(1, DETECT_MAX_RETRY + 1):
         try:
             detect_response = deepseek_chat(
-                system=system_prompt,
+                system=DETECT_V3_SYSTEM_PROMPT,
                 user=detect_prompt,
                 model=model,
                 temperature=0.0,
@@ -164,25 +138,6 @@ def _run_detect(
     if len(new_issues) != before:
         print(f"   ⏩ 过滤掉 {before - len(new_issues)} 个纯语气词删除项（不处理）")
 
-    # 过滤：单字重复（delete_text 仅 1 个字符）按「单字错误不处理」策略直接丢弃，
-    # 不进 verify，避免浪费 LLM 调用并污染决策日志。
-    before = len(new_issues)
-    new_issues = [
-        iss for iss in new_issues
-        if not _is_single_char_repeat(iss)
-    ]
-    if len(new_issues) != before:
-        print(f"   ⏩ 过滤掉 {before - len(new_issues)} 个单字重复项（delete_text 仅 1 字，不处理）")
-
-    # 过滤：自检撤回（detect 自己标「不报」的候选）直接丢弃，不进 verify。
-    before = len(new_issues)
-    new_issues = [
-        iss for iss in new_issues
-        if not _is_self_retract(iss)
-    ]
-    if len(new_issues) != before:
-        print(f"   ⏩ 过滤掉 {before - len(new_issues)} 个自检撤回项（detect 自标「不报」，不进 verify）")
-
     print(f"   Detect 完成 ({detect_elapsed:.1f}s): 发现 {len(new_issues)} 个候选问题")
     return new_issues
 
@@ -199,10 +154,7 @@ def _run_verify(
     model: str,
     effective_script: str,
     enable_thinking: bool = False,
-    system_prompt: str = CONFIRM_V3_SYSTEM_PROMPT,
     stage: str = "confirm",
-    build_verify_prompt_fn=build_confirm_v3_prompt,
-    single: bool = True,
 ) -> list[dict]:
     """执行一轮 Confirm：逐候选独立调用 LLM，物理消除批量一致性偏置。
 
@@ -210,18 +162,35 @@ def _run_verify(
     build_verify_prompt_fn 必须是单候选构造器 (iss, sentences, original_script)，
     如 build_confirm_v3_prompt。
 
-    LLM 调用失败时返回全部"不确认"占位，保持与输入一一对应。
+    并发 4 线程执行，LLM 调用失败时返回「不确认」占位，保持与输入一一对应。
     """
-    # V3 仅支持逐条模式（v1/v2 批量模式已移走）
-    verified: list[dict] = []
+    n = len(new_issues)
+    sent_map = {s["idx"]: s.get("text", "") for s in current_sentences}
+
+    # 预构建所有 prompt（主线程，安全）；idx 无效/已删的候选直接驳回占位，不送 LLM
     prompt_parts: list[str] = []
+    valid_orig_idx: list[int] = []
+    prefilled: dict[int, dict] = {}
+    for i, iss in enumerate(new_issues):
+        sid = iss.get("sentence_idx")
+        if sid is None or sid not in sent_map:
+            prefilled[i] = {
+                "action": "keep",
+                "delete_text": "",
+                "reason": f"候选句 句{sid} 不在当前文本中（可能已被前轮删除或 idx 无效），跳过确认",
+            }
+            continue
+        prompt_parts.append(
+            build_confirm_v3_prompt(iss, current_sentences, effective_script, context_radius=3)
+        )
+        valid_orig_idx.append(i)
+    results: dict[int, dict] = {}
     t0 = time.time()
-    for iss in new_issues:
-        prompt = build_verify_prompt_fn(iss, current_sentences, effective_script)
-        prompt_parts.append(prompt)
+
+    def _call_one(orig_i: int, prompt: str) -> tuple[int, dict]:
         try:
             resp = deepseek_chat(
-                system=system_prompt,
+                system=CONFIRM_V3_SYSTEM_PROMPT,
                 user=prompt,
                 model=model,
                 temperature=0.0,
@@ -231,17 +200,39 @@ def _run_verify(
             if not isinstance(dec, dict):
                 dec = {}
         except Exception as e:
-            print(f"   ⚠️ Confirm LLM 调用失败: {e}")
+            print(f"   ⚠️ Confirm LLM 调用失败 (候选#{orig_i}): {e}")
             dec = {"confirmed": False, "reason": f"LLM 调用失败: {e}"}
-        if "confirmed" not in dec:
-            dec["confirmed"] = False
+        # 规范化为「action + delete_text」模型
         if "action" not in dec:
-            dec["action"] = "delete"
-        verified.append(dec)
+            # 兼容旧格式：confirmed=false → keep；否则 delete
+            dec["action"] = "delete" if dec.get("confirmed") else "keep"
+        if "delete_text" not in dec:
+            dec["delete_text"] = ""
+        if "reason" not in dec:
+            dec["reason"] = ""
+        return orig_i, dec
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(_call_one, orig_i, p): orig_i
+            for orig_i, p in zip(valid_orig_idx, prompt_parts)
+        }
+        for future in as_completed(futures):
+            orig_i, dec = future.result()
+            results[orig_i] = dec
+
+    # 按原始顺序还原（无效候选用 prefilled 占位）
+    verified: list[dict] = []
+    for i in range(n):
+        if i in prefilled:
+            verified.append(prefilled[i])
+        else:
+            verified.append(results[i])
+
     # 合并落盘所有单条 prompt（保持可整体核查，对齐 judge 的合并写法）
     merged = "\n\n".join(
-        f"{'=' * 50}  候选 #{i}  {'=' * 50}\n\n{p}"
-        for i, p in enumerate(prompt_parts)
+        f"{'=' * 50}  候选 #{orig_i}  {'=' * 50}\n\n{p}"
+        for orig_i, p in zip(valid_orig_idx, prompt_parts)
     )
     try:
         (loop_dir / f"loop_round{round_num}_{stage}.txt").write_text(
@@ -249,12 +240,13 @@ def _run_verify(
         )
     except Exception as e:
         print(f"   ⚠️ confirm prompt 合并写入失败: {e}")
-    print(f"   Confirm 完成 ({time.time() - t0:.1f}s), 逐条 {len(verified)} 项")
+    elapsed = time.time() - t0
+    print(f"   Confirm 完成 ({elapsed:.1f}s), 并发4, 逐条 {n} 项")
     return verified
 
 
 # ============================================================
-#  Step 3: 构建决策对象（misread 维度：off_topic / resay）
+#  Step 3: 构建决策对象（misread 维度：仅 resay）
 # ============================================================
 
 def _make_decision_obj(
@@ -265,12 +257,12 @@ def _make_decision_obj(
 ) -> dict:
     """根据单个 detect issue 与其 confirm 结果，构建嵌套格式 decision_obj。
 
-    V3 仅处理 misread 维度：off_topic / resay 均整句删（mode=full，action="delete"）。
-    目标句取 delete_sentence_idx（off_topic/resay 通常与 sentence_idx 相同）。
+    V3 仅处理 misread 维度：resay 整句删（mode=full，action="delete"）。
+    目标句即该句 sentence_idx。
     """
     dim = iss.get("dimension", "")
     sub = iss.get("subtype", "")
-    delete_sid = iss.get("delete_sentence_idx", iss.get("sentence_idx"))
+    delete_sid = iss.get("sentence_idx")
     target_sid = delete_sid if delete_sid is not None else iss.get("sentence_idx")
 
     # 获取目标句子的 range 和 text
@@ -282,10 +274,10 @@ def _make_decision_obj(
             target_text = s.get("text", "")
             break
 
-    confirmed = v.get("confirmed", False)
     action = v.get("action", "delete")
-    # 整段删除（off_topic/resay 确认且 action==delete）→ mode="full"；其余无 mode
-    mode = "full" if (confirmed and action == "delete") else None
+    delete_text = (v.get("delete_text") or "").strip()
+    # 由 delete_text 驱动：给了精确待删文字即视为确认删除
+    confirmed = (action == "delete" and bool(delete_text))
 
     return {
         "round": round_num,
@@ -295,25 +287,21 @@ def _make_decision_obj(
             "sent_idx": target_sid,
             "range": target_range,
             "text": target_text[:80] if len(target_text) > 80 else target_text,
-            "decision_hint": iss.get("description", ""),
+            "decision_hint": iss.get("error_text", ""),
             # 兼容 assemble 的原始字段
             "dimension": dim,
             "severity": iss.get("severity", ""),
             "sentence_idx": iss.get("sentence_idx"),
-            "delete_sentence_idx": iss.get("delete_sentence_idx"),
             "error_text": iss.get("error_text", ""),
-            "delete_text": iss.get("delete_text", ""),
-            "char_offset": iss.get("char_offset"),
-            "description": iss.get("description", ""),
+            "delete_text": delete_text,
         },
         "decision": {
             "sentence": target_sid,
-            "mode": mode,
-            "keep_head": None,
             "action": action,
-            "llm_reason": v.get("reason", ""),
+            "delete_text": delete_text,
             "confirmed": confirmed,
             "reason": v.get("reason", ""),
+            "llm_reason": v.get("reason", ""),
         },
         "action": action,
     }
@@ -329,40 +317,58 @@ def _apply_and_log(
     current_sentences: list[dict],
     words: list[dict],
     round_confirmed: list[dict],
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """应用本轮确认删除、打印统计、记录 apply 后句子到 loop_round{N}_sentences.txt。
 
     Returns:
-        应用删除后的 current_sentences（idx/range 保持不变）
+        (应用删除后的 current_sentences, applied_records)
+        - current_sentences: idx/range 保持不变
+        - applied_records: 与 round_confirmed 平行，含每条实际删除的文字/词索引/模式
     """
     print(f"\n[Apply] 应用 {len(round_confirmed)} 个确认删除...")
-    current_sentences = apply_deletions_to_sentences(
+    current_sentences, applied_records = apply_deletions_to_sentences(
         sentences=current_sentences,
         words=words,
         confirmed_issues=round_confirmed,
     )
 
+    # 逐条精确打印实际删除内容
+    for iss, rec in zip(round_confirmed, applied_records):
+        sid = rec.get("sid")
+        mode = rec.get("mode")
+        dt = rec.get("deleted_text", "")
+        if mode == "full":
+            tag = "整句"
+        elif mode == "partial":
+            tag = "片段"
+        else:
+            tag = "未命中"
+        print(f"      🗑 句{sid} [{tag}删除] 实际删除: 「{dt}」")
+
     total_chars_after = sum(len(s.get("text", "")) for s in current_sentences)
     print(f"   应用完成，当前文本总长: {total_chars_after} 字\n")
 
-    _sent_log_path = loop_dir / f"loop_round{round_num}_sentences.txt"
-    with open(_sent_log_path, "w", encoding="utf-8") as _sf:
-        _sf.write(f"===== Round {round_num} | SENTENCES AFTER APPLY =====\n")
-        _sf.write(f"总句数: {len(current_sentences)}  总字数: {total_chars_after}\n\n")
-        for s in current_sentences:
-            _sf.write(f"[句{s.get('idx')}] {s.get('text', '')}\n")
+    write_sentences(
+        loop_dir / f"loop_round{round_num}_sentences.txt",
+        current_sentences,
+    )
 
-    return current_sentences
+    return current_sentences, applied_records
 
 
 # ============================================================
 #  收尾：保存结果 + 汇总打印
 # ============================================================
 
-def _save_and_report(output_path: Path, all_decisions: list[dict]) -> None:
-    """保存 review_loop_decisions.json 并打印汇总。"""
+def _save_decisions_file(output_path: Path, all_decisions: list[dict]) -> None:
+    """落盘 review_loop_decisions.json（每轮循环都调用，便于观察中间过程）。"""
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(all_decisions, f, ensure_ascii=False, indent=2)
+
+
+def _save_and_report(output_path: Path, all_decisions: list[dict]) -> None:
+    """保存 review_loop_decisions.json 并打印汇总。"""
+    _save_decisions_file(output_path, all_decisions)
 
     applied = sum(1 for d in all_decisions if d.get("decision", {}).get("confirmed"))
     rejected = sum(1 for d in all_decisions if not d.get("decision", {}).get("confirmed"))
@@ -375,12 +381,77 @@ def _save_and_report(output_path: Path, all_decisions: list[dict]) -> None:
     print("=" * 50 + "\n")
 
 
+def _dedup_issues(issues: list[dict]) -> list[dict]:
+    """同一 sentence_idx 重复检出 → 保留第一个。"""
+    seen_sids: dict[int, dict] = {}
+    deduped: list[dict] = []
+    for iss in issues:
+        sid = iss.get("sentence_idx")
+        if sid is None:
+            deduped.append(iss)
+            continue
+        if sid not in seen_sids:
+            seen_sids[sid] = iss
+            deduped.append(iss)
+    return deduped
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """去标点、去空格、小写 → 用于物理去重的文本归一化。"""
+    import re
+    t = re.sub(r"[\s，。！？；、：""'…—\-\(\)\[\]【】《》〈〉]", "", text)
+    return t.lower()
+
+
+def _dedup_issues_physical(issues: list[dict], sentences: list[dict]) -> list[dict]:
+    """物理去重：不同 sentence_idx 但指向相同归一化句文本 → 合并，保留第一个。"""
+    sent_text_map = {s["idx"]: s.get("text", "") for s in sentences}
+    seen_texts: dict[str, dict] = {}
+    deduped: list[dict] = []
+    for iss in issues:
+        sid = iss.get("sentence_idx")
+        if sid is None:
+            deduped.append(iss)
+            continue
+        raw = sent_text_map.get(sid, "")
+        norm = _normalize_for_dedup(raw)
+        if not norm:
+            deduped.append(iss)
+            continue
+        if norm not in seen_texts:
+            seen_texts[norm] = iss
+            deduped.append(iss)
+    return deduped
+
+
+def _dedup_issues_cross_round(
+    new_issues: list[dict],
+    all_decisions: list[dict],
+) -> list[dict]:
+    """跨轮去重：过滤 all_decisions 中已决策过的 sentence_idx（不论 confirmed 还是 rejected）。"""
+    decided_sids: set[int] = set()
+    for d in all_decisions:
+        iss = d.get("issue", {})
+        sid = iss.get("sentence_idx")
+        if sid is not None:
+            decided_sids.add(int(sid))
+
+    deduped: list[dict] = []
+    for iss in new_issues:
+        sid = iss.get("sentence_idx")
+        if sid is not None and int(sid) in decided_sids:
+            print(f"      ⚠️ 跨轮去重: 句{sid} 已在先前轮次决策过，跳过")
+            continue
+        deduped.append(iss)
+
+    return deduped
+
+
 # ============================================================
 #  主循环入口：V3 读稿错误检测（检测 + 确认）
 # ============================================================
 
 def run_agent_review_loop_v3(
-    analysis_dir: Path,
     loop_dir: Path,
     sentences: list[dict],
     words: list[dict],
@@ -422,14 +493,15 @@ def run_agent_review_loop_v3(
             effective_script=_effective_script,
             all_decisions=all_decisions,
             enable_thinking=enable_thinking,
-            system_prompt=DETECT_V3_SYSTEM_PROMPT,
             stage="detect_v3",
-            build_prompt_fn=build_detect_v3_prompt,
         )
         if new_issues is None:
             break
         # 安全过滤：只保留 misread 维度（检测越界报的其它类不要）
         new_issues = [iss for iss in new_issues if iss.get("dimension") == "misread"]
+        new_issues = _dedup_issues(new_issues)
+        new_issues = _dedup_issues_physical(new_issues, current_sentences)
+        new_issues = _dedup_issues_cross_round(new_issues, all_decisions)
         if not new_issues:
             consecutive_empty_rounds += 1
             print(f"   ✅ 无新错误 ({consecutive_empty_rounds}/{consecutive_empty_to_exit} 连续空轮)")
@@ -455,41 +527,50 @@ def run_agent_review_loop_v3(
             model=model,
             effective_script=_effective_script,
             enable_thinking=enable_thinking,
-            system_prompt=CONFIRM_V3_SYSTEM_PROMPT,
             stage="confirm_v3",
-            build_verify_prompt_fn=build_confirm_v3_prompt,
-            single=True,
         )
 
-        # === Step 3: 合并 + 分流（删 / 仅标注）===
+        # === Step 3: 合并 + 分流（删 / 保留）===
+        # 新模型：confirm 只输出 delete_text；action=delete 且 delete_text 非空即确认删除，
+        # 整句删还是部分删由 apply 根据 delete_text 与整句关系确定性判定（去掉 mode/keep_head）。
         round_confirmed: list[dict] = []
+        round_confirmed_objs: list[dict] = []  # 与 round_confirmed 平行，指向 all_decisions 中对应决策对象
         for i, iss in enumerate(new_issues):
             v = verified[i] if i < len(verified) else {
-                "index": i, "confirmed": False, "action": "delete", "reason": "无验证结果",
+                "index": i, "action": "keep", "delete_text": "", "reason": "无验证结果",
             }
             obj = _make_decision_obj(iss, v, round_num, current_sentences)
             all_decisions.append(obj)
-            if v.get("confirmed"):
-                action = v.get("action", "delete")
-                if action == "delete":
-                    round_confirmed.append(iss)
-                    print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]}")
-                else:  # report：仅标注，不删（仍随 all_decisions 落单文件）
-                    print(f"      📌 #{i} 仅标注(report): {v.get('reason', '')[:60]}")
+            action = v.get("action", "delete")
+            delete_text = (v.get("delete_text") or "").strip()
+            if action == "delete" and delete_text:
+                aug = dict(iss)
+                aug["delete_text"] = delete_text  # 以 confirm 给出的精确待删文字为准
+                round_confirmed.append(aug)
+                round_confirmed_objs.append(obj)
+                print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]} ｜待删='{delete_text}'")
             else:
-                print(f"      ❌ #{i} 驳回: {v.get('reason', '')[:60]}")
+                print(f"      ❌ #{i} 保留: {v.get('reason', '')[:60]}")
+
+        # 每轮合并完决策后立即落盘，便于观察中间过程
+        _save_decisions_file(output_path, all_decisions)
 
         if not round_confirmed:
             print(f"\n   本轮无确认删除，继续下一轮\n")
             continue
 
-        current_sentences = _apply_and_log(
+        current_sentences, applied_records = _apply_and_log(
             loop_dir=loop_dir,
             round_num=round_num,
             current_sentences=current_sentences,
             words=words,
             round_confirmed=round_confirmed,
         )
+
+        # 把实际删除文字写回决策对象（与 round_confirmed / round_confirmed_objs 平行对齐）
+        for obj, rec in zip(round_confirmed_objs, applied_records):
+            obj.setdefault("decision", {})["applied_text"] = rec.get("deleted_text", "")
+        _save_decisions_file(output_path, all_decisions)
 
     # === 保存决策（删除 / 仅标注 / 驳回 全部合并为单文件，对齐 福总 格式）===
     _save_and_report(output_path, all_decisions)

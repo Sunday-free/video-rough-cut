@@ -203,7 +203,7 @@ def _run_review_loop_phase(
             and d.get("decision", {}).get("action") != "report"
         ]
         if _confirmed_issues:
-            current_sentences = apply_deletions_to_sentences(
+            current_sentences, _ = apply_deletions_to_sentences(
                 sentences=cleaned,
                 words=words_data,
                 confirmed_issues=_confirmed_issues,
@@ -222,7 +222,6 @@ def _run_review_loop_phase(
     # LLM 循环检测（复用 Judge 清洗后的 cleaned 引用，不再回读磁盘）
     # 固定使用 V3：对照原稿找"说错"（检测 + 确认 双 Agent）。
     _loop_path, loop_decisions, current_sentences = run_agent_review_loop_v3(
-        analysis_dir=analysis_dir,
         loop_dir=detect_agent_dir(analysis_dir),
         words=words_data,
         model=model,
@@ -230,7 +229,7 @@ def _run_review_loop_phase(
         original_script=original_script,
         sentences=cleaned,
         max_rounds=max_rounds,
-        consecutive_empty_to_exit=1,
+        consecutive_empty_to_exit=2,
         enable_thinking=enable_deepseek_thinking,
     )
 

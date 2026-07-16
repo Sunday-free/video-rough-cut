@@ -26,7 +26,6 @@ def _load_api_key_from_env() -> str:
     env_paths = [
         Path(__file__).resolve().parent / ".env",          # 同目录
         Path(__file__).resolve().parents[1] / ".env",       # 上级目录
-        Path("/Users/wangjianmin/Workbuddy/2026-07-06-15-13-16/output/.env"),  # 绝对路径回退
     ]
     
     for env_path in env_paths:

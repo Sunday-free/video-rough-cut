@@ -27,12 +27,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from speech_error_detector.ai.chat import DEFAULT_MODEL
+
 from speech_error_detector.utils.sentence_io import load_sentences, write_sentences
+from speech_error_detector.utils.compare_truth import compare_with_truth
 from speech_error_detector.detect_agent.review_loop import (
     _run_detect,
     _run_verify,
     run_agent_review_loop_v3,
 )
+from speech_error_detector.detect_agent.agent_apply import apply_deletions_to_sentences
 from speech_error_detector.assemble.assemble import run_assemble, generate_report_markdown
 
 # 默认以 man 姐为例
@@ -41,7 +45,7 @@ dirs = [
     {"dir": "2026-07-07_红姐", "language": "zh-CN"},
     {"dir": "2026-07-07_man姐", "language": "zh-CN"},
 ]
-RUN_INDEX = 0   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
+RUN_INDEX = 1   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
 BASE = dirs[RUN_INDEX]["dir"]
 DEFAULT_SENTENCES = ROOT / BASE / "2_分析/sentences_origin.txt"
 DEFAULT_WORDS = ROOT / BASE / "1_转录/subtitles_words.json"
@@ -113,14 +117,28 @@ def run_single_round(sentences, model, do_confirm, loop_dir, original_script, wo
         print(f"  -> #{i} {mark}: {v.get('reason')}")
 
     # 应用删除，保存最终 sentences
-    delete_idxs = set()
+    # ⚠️ 必须用 apply_deletions_to_sentences：它按 confirm 给出的 delete_text 做【片段删除】，
+    #    而不是按 idx 整句删。否则即便 delete_text 精确到片段，整句仍会被删（误删根因）。
+    words = []
+    if words_path and Path(words_path).exists():
+        words = json.loads(Path(words_path).read_text(encoding="utf-8"))
+    confirmed_issues = []
     for i, iss in enumerate(issues):
         v = verified[i]
         if v.get("action") == "delete" and (v.get("delete_text") or "").strip():
-            sid = iss.get("sentence_idx")
-            if sid is not None:
-                delete_idxs.add(sid)
-    applied = [s for s in current if s.get("idx") not in delete_idxs]
+            aug = dict(iss)
+            aug["delete_text"] = v["delete_text"].strip()
+            confirmed_issues.append(aug)
+    applied, applied_records = apply_deletions_to_sentences(
+        sentences=current, words=words, confirmed_issues=confirmed_issues,
+    )
+    # 逐条精确打印实际删除内容
+    for iss, rec in zip(confirmed_issues, applied_records):
+        sid = rec.get("sid")
+        mode = rec.get("mode")
+        dt = rec.get("deleted_text", "")
+        tag = {"full": "整句", "partial": "片段", None: "未命中"}.get(mode, "未命中")
+        print(f"      🗑 句{sid} [{tag}删除] 实际删除: 「{dt}」")
     final_path = loop_dir / "sentences_final.txt"
     write_sentences(final_path, applied, original=current)
     print(f"\n📄 删除后句子已保存: {final_path}")
@@ -170,75 +188,6 @@ def _write_misread_report(
     print(f"📄 口误分析报告已保存: {report_path}")
 
 
-def _compare_parse(path: Path) -> dict:
-    """解析 `idx|range|text` 为 {idx: text.strip()}。"""
-    m = {}
-    if not path.exists():
-        return m
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("|", 2)
-        if len(parts) < 2:
-            continue
-        try:
-            idx = int(parts[0].strip())
-        except ValueError:
-            continue
-        m[idx] = parts[2].strip() if len(parts) >= 3 else ""
-    return m
-
-
-def compare_with_truth(final_path: Path, truth_path: Path) -> dict:
-    """生成 sentences_final.txt 后自动比对各目录 sentences.txt（无误删遗漏真值版）。
-    分类：误删(真值有文本/final无) / 漏删(真值空/final有) / 文本差异(都有但不同)。"""
-    if not truth_path.exists():
-        print(f"\n⚠️ 未找到真值文件 {truth_path}，跳过比对")
-        return {}
-    truth = _compare_parse(truth_path)
-    final = _compare_parse(final_path)
-    missing, extra, diff, only_final = [], [], [], []
-    ok_keep = ok_del = 0
-    for idx, t in truth.items():
-        f = final.get(idx, "")
-        if t and not f:
-            missing.append((idx, t))
-        elif (not t) and f:
-            extra.append((idx, f))
-        elif t and f:
-            if t == f:
-                ok_keep += 1
-            else:
-                diff.append((idx, t, f))
-        else:  # 都空 → 都删，一致
-            ok_del += 1
-    for idx in final:
-        if idx not in truth:
-            only_final.append(idx)
-    base = truth_path.parent.name
-    lines = []
-    lines.append(f"===== 比对（{base}）：真值 {truth_path.name} vs {final_path.name} =====")
-    lines.append(f"  ✅ 一致保留 {ok_keep} | ✅ 一致删除 {ok_del}")
-    lines.append(f"  ❌ 误删 {len(missing)} | ⚠️ 漏删 {len(extra)} | 🔶 文本差异 {len(diff)} | 🔸 仅final多出 {len(only_final)}")
-    for idx, t in missing:
-        lines.append(f"    [误删] 句{idx}（整句被删）: 真值={t!r}")
-    for idx, f in extra:
-        lines.append(f"    [漏删] 句{idx}（整句应删未删）: final={f!r}")
-    for idx, t, f in diff:
-        lines.append(f"    [文本差异] 句{idx}:\n        真值={t!r}\n        final={f!r}")
-    for idx in only_final:
-        lines.append(f"    [仅final多出] 句{idx}: final={final[idx]!r}")
-    for line in lines:
-        print(line)
-
-    # 落盘：与 final_path 同目录，文件名 compare_vs_truth.txt
-    out_path = final_path.parent / "compare_vs_truth.txt"
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"📄 比对结果已保存: {out_path}\n")
-    return {"missing": missing, "extra": extra, "diff": diff, "only_final": only_final,
-            "ok_keep": ok_keep, "ok_del": ok_del, "report_path": str(out_path)}
-
-
 def run_full(sentences, words, model, rounds, analysis_dir, original_script, words_path=None, truth_path=None) -> None:
     print(f"V3 完整循环：{len(sentences)} 句（max_rounds={rounds}）\n")
     pre_filter = [s for s in sentences if s.get("text", "").strip()]
@@ -248,7 +197,7 @@ def run_full(sentences, words, model, rounds, analysis_dir, original_script, wor
         words=words,
         model=model,
         max_rounds=rounds,
-        consecutive_empty_to_exit=2,
+        consecutive_empty_to_exit=1,
         use_original_script=bool(original_script),
         original_script=original_script,
         enable_thinking=False,
@@ -276,7 +225,7 @@ def main() -> None:
     ap.add_argument("--detect-only", action="store_true", help="只跑 detect 不跑 confirm")
     ap.add_argument("--full", action="store_true", help="跑完整 V3 循环")
     ap.add_argument("--rounds", type=int, default=5)
-    ap.add_argument("--model", default="deepseek-v4-pro")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     args = ap.parse_args()
 
     # 按 run-index 选择数据目录，输出隔离到独立子目录（避免三份结果互相覆盖）

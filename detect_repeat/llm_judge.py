@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from speech_error_detector.ai.deepseek_client import deepseek_chat
+from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
 from speech_error_detector.ai.llm_parse import parse_json_object
 from speech_error_detector.detect_repeat.judge_prompts import (
     PROMPTS,
@@ -127,7 +127,7 @@ def run_llm_judge(
     sentences: list[dict],
     output_dir: Path,
     detector_name: str,
-    model: str = "deepseek-v4-pro",
+    model: str = DEFAULT_MODEL,
     enable_thinking: bool | None = None,
     round_idx: int | None = None,
 ) -> tuple[Path, list]:
@@ -163,7 +163,7 @@ def run_llm_judge(
 
     def _judge_one(idx: int) -> tuple[int, dict]:
         try:
-            response_text = deepseek_chat(
+            response_text = chat(
                 system=system_prompt,
                 user=round_prompts[idx],
                 model=model,
@@ -262,7 +262,7 @@ def run_all_judges(
     analysis_dir: Path,
     sentences: list[dict],
     detect_data: dict[str, list[dict]],
-    model: str = "deepseek-v4-pro",
+    model: str = DEFAULT_MODEL,
     enable_thinking: bool | None = None,
     round_idx: int | None = None,
 ) -> dict[str, tuple[Path, list]]:

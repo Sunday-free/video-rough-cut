@@ -8,6 +8,8 @@
 被 review_loop.py 复用。
 """
 
+import re
+
 from speech_error_detector.utils.fillers import MODAL_CHARS, FILLER_CHARS
 
 
@@ -28,7 +30,7 @@ def _norm_text(s: str) -> tuple[str, list[int]]:
     """去标点/空白/语气词/虚词归一化，返回 (归一串, 原字符索引映射)。
 
     剥离语气词(呢/啊/呀…)与虚词(的/了/把…)后比对，避免口语语气词干扰
-    resay 判定（如「新能源车呢是…」与「新能源车是…」应视为同一内容）。
+    resay 判定（如「〔甲内容〕呢是…」与「〔甲内容〕是…」应视为同一内容）。
     """
     out_chars: list[str] = []
     orig_idx: list[int] = []
@@ -39,11 +41,31 @@ def _norm_text(s: str) -> tuple[str, list[int]]:
         orig_idx.append(i)
     return "".join(out_chars), orig_idx
 
+def _pick_occurrence(starts: list[int], reason: str) -> int:
+    """delete_text 在句中出现多次时，二选一确定要删的位置。
+
+    口播场景里「残句重说 / 片段裁剪 / 尾部残片」几乎都位于句尾，故默认删【最后一个】
+    匹配；仅当 confirm 理由显式指明「开头 / 前半 / 前面」时才删【第一个】匹配。
+
+    返回选定的起始下标；starts 为空返回 -1。
+    """
+    if not starts:
+        return -1
+    if len(starts) == 1:
+        return starts[0]
+    r = (reason or "")
+    if any(k in r for k in ("开头", "前半", "前面", "前置", "首句")):
+        return starts[0]
+    # 默认尾部优先
+    return starts[-1]
+
+
 def _locate_delete_words(
     sid: int,
     delete_text: str,
     words: list[dict],
     range_map: dict[int, tuple[int, int]],
+    reason: str = "",
 ) -> tuple[set[int] | None, str]:
     """在句 sid 中定位 delete_text 对应的【词索引】集合（确定性，不依赖 LLM）。
 
@@ -78,26 +100,24 @@ def _locate_delete_words(
     norm_raw, orig_idx = _norm_text(raw)
     norm_dt, _ = _norm_text(delete_text)
     if norm_dt:
-        start = norm_raw.find(norm_dt)
+        starts = [m.start() for m in re.finditer(re.escape(norm_dt), norm_raw)]
+        start = _pick_occurrence(starts, reason)
         if start >= 0:
             end = start + len(norm_dt)
             o_start = orig_idx[start]
             o_end = orig_idx[end - 1] + 1
             to_delete = {wi for cpos, wi in pos2wi.items() if o_start <= cpos < o_end}
             to_delete_text = "".join(words[wi].get("text", "") for wi in sorted(to_delete))
-            print("delete_text", delete_text)
-            print("to_delete_text", to_delete_text)
             return (to_delete if to_delete else None), to_delete_text
 
     # 兜底：不经归一化直接在原始句文本里找
-    raw_start = raw.find(delete_text)
+    raw_starts = [m.start() for m in re.finditer(re.escape(delete_text), raw)]
+    raw_start = _pick_occurrence(raw_starts, reason)
     if raw_start < 0:
         return None, ""
     raw_end = raw_start + len(delete_text)
     to_delete = {wi for cpos, wi in pos2wi.items() if raw_start <= cpos < raw_end}
     to_delete_text = "".join(words[wi].get("text", "") for wi in sorted(to_delete))
-    print("delete_text", delete_text)
-    print("to_delete_text", to_delete_text)
     return (to_delete if to_delete else None), to_delete_text
 
 def build_sent_range_map(sentences: list[dict]) -> dict[int, tuple[int, int]]:
@@ -172,7 +192,8 @@ def apply_deletions_to_sentences(
             continue
 
         delete_text = (iss.get("delete_text") or "").strip()
-        to_delete, deleted_text = _locate_delete_words(target_sid, delete_text, words, range_map)
+        reason = iss.get("delete_reason", iss.get("reason", ""))
+        to_delete, deleted_text = _locate_delete_words(target_sid, delete_text, words, range_map, reason)
         rec = {
             "sid": target_sid,
             "deleted_text": deleted_text,

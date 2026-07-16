@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from speech_error_detector.detect_repeat.llm_judge import PROMPTS
-from speech_error_detector.ai.deepseek_client import deepseek_chat
+from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
 from speech_error_detector.ai.llm_parse import parse_json_object, parse_json_array
 
 DEFAULT_DIR = Path(__file__).resolve().parent / "detect_judge_data"
@@ -34,7 +34,7 @@ _SPLIT_RE = re.compile(r"\n*={2,}\s*检测 #\d+\s*={2,}\n*")
 # ---- 写死的运行参数（改这里即可）----
 RUN_DIR = DEFAULT_DIR                      # 含 judge_prompt_*.txt 的目录
 RUN_OUT_DIR = Path(__file__).resolve().parent / "test_output_detect_judge"  # 结果输出目录
-RUN_MODEL = "deepseek-v4-pro"
+RUN_MODEL = DEFAULT_MODEL
 RUN_TEMPERATURE = 0.1
 RUN_THINKING = None                        # enable_thinking: True / False，None=不传（由模型决定）
 RUN_LIST_ONLY = False                      # True=只列出将测文件/prompt 数与 system prompt，不调 LLM
@@ -101,7 +101,7 @@ def main():
         for k, user in enumerate(prompts):
             print(f"\n--- prompt #{k} (共 {len(prompts)} 条) ---")
             try:
-                resp = deepseek_chat(
+                resp = chat(
                     system=system_prompt,
                     user=user,
                     model=RUN_MODEL,

@@ -28,6 +28,8 @@ from pathlib import Path
 # 添加项目根目录
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from speech_error_detector.ai.chat import DEFAULT_MODEL
+
 
 from speech_error_detector.detect_repeat.detect_loop import run_detect_judge_loop
 from speech_error_detector.assemble.assemble import run_assemble, generate_report_markdown, generate_updated_sentences
@@ -229,7 +231,7 @@ def _run_review_loop_phase(
         original_script=original_script,
         sentences=cleaned,
         max_rounds=max_rounds,
-        consecutive_empty_to_exit=2,
+        consecutive_empty_to_exit=1,
         enable_thinking=enable_deepseek_thinking,
     )
 
@@ -301,7 +303,8 @@ def run_pipeline(
     skip_judge: bool = False,
     skip_loop: bool = False,
     silence_thresh: float = 0.3,
-    model: str = "deepseek-v4-pro",
+    detect_repeat_model: str = "deepseek-v4-pro",
+    detect_agent_model: str = DEFAULT_MODEL,
     video_duration: float = 0.0,
     enable_deepseek_thinking: bool = False,
     split_mode: str = "silence",
@@ -324,7 +327,8 @@ def run_pipeline(
         skip_judge: 跳过 LLM 研判 Layer 2（使用磁盘已有的 decisions_*.json）
         skip_loop: 跳过 Agent 循环审查（步骤5-7）
         silence_thresh: 静音删除阈值(秒)
-        model: LLM 模型名
+        detect_repeat_model: 机械检测(重复/残句)所用模型，默认 deepseek-v4-pro（DeepSeek pro）
+        detect_agent_model:  Agent 循环审查(V3) 所用模型，默认 DEFAULT_MODEL
         video_duration: 视频时长(秒)，用于结尾补尾
         enable_deepseek_thinking: 开启 DeepSeek 思考模式
 
@@ -394,7 +398,7 @@ def run_pipeline(
         analysis_dir=analysis_dir,
         words_data=words_data,
         sentences_path=sentences_path,
-        model=model,
+        model=detect_repeat_model,
         enable_deepseek_thinking=enable_deepseek_thinking,
         skip_judge=skip_judge,
         max_det_rounds=max_det_rounds,
@@ -405,7 +409,7 @@ def run_pipeline(
     current_sentences, loop_decisions = _run_review_loop_phase(
         analysis_dir=analysis_dir,
         words_data=words_data,
-        model=model,
+        model=detect_agent_model,
         use_original_script=use_original_script,
         original_script=original_script,
         cleaned=cleaned,

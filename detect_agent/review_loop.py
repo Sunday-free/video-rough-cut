@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from speech_error_detector.ai.deepseek_client import deepseek_chat
+from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
 from speech_error_detector.ai.llm_parse import parse_json_object
 
 # 通用工具（V3 的 detect/apply 依赖），来自同包 agent_apply：
@@ -104,7 +104,7 @@ def _run_detect(
     detect_response = None
     for attempt in range(1, DETECT_MAX_RETRY + 1):
         try:
-            detect_response = deepseek_chat(
+            detect_response = chat(
                 system=DETECT_V3_SYSTEM_PROMPT,
                 user=detect_prompt,
                 model=model,
@@ -120,6 +120,7 @@ def _run_detect(
             else:
                 print(f"   ⚠️ Detect LLM 连续 {DETECT_MAX_RETRY} 次调用失败: {e}")
     if detect_response is None:
+        print(f"detect_response 为空")
         return None
 
     detect_elapsed = time.time() - t0
@@ -189,7 +190,7 @@ def _run_verify(
 
     def _call_one(orig_i: int, prompt: str) -> tuple[int, dict]:
         try:
-            resp = deepseek_chat(
+            resp = chat(
                 system=CONFIRM_V3_SYSTEM_PROMPT,
                 user=prompt,
                 model=model,
@@ -275,7 +276,12 @@ def _make_decision_obj(
             break
 
     action = v.get("action", "delete")
-    delete_text = (v.get("delete_text") or "").strip()
+    # detect 环节给出的待删文字（原始）
+    detect_delete = (iss.get("delete_text") or "").strip()
+    # confirm 环节给出的待删文字（可能留空表示信任 detect）
+    confirm_delete = (v.get("delete_text") or "").strip()
+    # 生效的待删文字：confirm 留空 → 回退使用 detect 的；否则用 confirm 纠正后的
+    delete_text = confirm_delete if confirm_delete else detect_delete
     # 由 delete_text 驱动：给了精确待删文字即视为确认删除
     confirmed = (action == "delete" and bool(delete_text))
 
@@ -293,12 +299,15 @@ def _make_decision_obj(
             "severity": iss.get("severity", ""),
             "sentence_idx": iss.get("sentence_idx"),
             "error_text": iss.get("error_text", ""),
-            "delete_text": delete_text,
+            "delete_text": detect_delete,
+            "is_real_error": v.get("is_real_error"),
         },
         "decision": {
             "sentence": target_sid,
             "action": action,
             "delete_text": delete_text,
+            "delete_text_detect": detect_delete,
+            "delete_text_confirm": confirm_delete,
             "confirmed": confirmed,
             "reason": v.get("reason", ""),
             "llm_reason": v.get("reason", ""),
@@ -455,7 +464,7 @@ def run_agent_review_loop_v3(
     loop_dir: Path,
     sentences: list[dict],
     words: list[dict],
-    model: str = "deepseek-v4-pro",
+    model: str = DEFAULT_MODEL,
     max_rounds: int = MAX_ROUNDS,
     consecutive_empty_to_exit: int = CONSECUTIVE_EMPTY_TO_EXIT,
     use_original_script: bool = False,
@@ -531,8 +540,10 @@ def run_agent_review_loop_v3(
         )
 
         # === Step 3: 合并 + 分流（删 / 保留）===
-        # 新模型：confirm 只输出 delete_text；action=delete 且 delete_text 非空即确认删除，
-        # 整句删还是部分删由 apply 根据 delete_text 与整句关系确定性判定（去掉 mode/keep_head）。
+        # detect 与 confirm 都给出 delete_text：confirm 校验 detect 的 delete_text 是否正确，
+        # 正确则留空（下游回退用 detect 的），有误则给真正的 delete_text。
+        # action=delete 且最终 delete_text 非空即确认删除；
+        # 整句删还是部分删由 apply 根据 delete_text 与整句关系确定性判定。
         round_confirmed: list[dict] = []
         round_confirmed_objs: list[dict] = []  # 与 round_confirmed 平行，指向 all_decisions 中对应决策对象
         for i, iss in enumerate(new_issues):
@@ -542,13 +553,20 @@ def run_agent_review_loop_v3(
             obj = _make_decision_obj(iss, v, round_num, current_sentences)
             all_decisions.append(obj)
             action = v.get("action", "delete")
-            delete_text = (v.get("delete_text") or "").strip()
+            # detect 原始 delete_text
+            detect_delete = (iss.get("delete_text") or "").strip()
+            # confirm 给出的 delete_text（可能留空表示信任 detect）
+            confirm_delete = (v.get("delete_text") or "").strip()
+            # 生效 delete_text：confirm 留空 → 用 detect 的；否则用 confirm 纠正后的
+            delete_text = confirm_delete if confirm_delete else detect_delete
+            # 打印 detect 与 confirm 的 delete_text
             if action == "delete" and delete_text:
                 aug = dict(iss)
-                aug["delete_text"] = delete_text  # 以 confirm 给出的精确待删文字为准
+                aug["delete_text"] = delete_text  # confirm 留空时用 detect 的；否则用 confirm 纠正后的
+                aug["delete_reason"] = v.get("reason", "")  # 传给 apply 用于多匹配消歧（开头/前半→首部）
                 round_confirmed.append(aug)
                 round_confirmed_objs.append(obj)
-                print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]} ｜待删='{delete_text}'")
+                print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]} ｜最终待删='{delete_text}'")
             else:
                 print(f"      ❌ #{i} 保留: {v.get('reason', '')[:60]}")
 

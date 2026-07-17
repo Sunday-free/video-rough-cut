@@ -270,7 +270,10 @@ def detect_intra(sentences: list[dict], original_script: str = "") -> list[dict]
                 if all(ch in MODAL_CHARS for ch in sub):
                     continue
                 j = txt.find(sub, i + length)  # 在后面查找相同子串
-                if j != -1 and (j - (i + length)) <= 3:  # 距离 <= 3 字符
+                # 距离阈值：纯数字子串放宽到 8 字符（数字远距离重复几乎都是口误重说，
+                # 如"8000股全部卖掉8000"），其余仍为 <= 3 字符。
+                max_gap = 8 if all(_is_digit_char(ch) for ch in sub) else 3
+                if j != -1 and (j - (i + length)) <= max_gap:
                     # 自然叠词 / 并列重复（如"一波一波""一波还有一波""寻思寻思"）
                     # 是正常口语，不是口误，跳过。
                     if _is_natural_reduplication(txt, sub, i, j):

@@ -43,9 +43,6 @@ def _load_api_key() -> str:
 # API Key：优先环境变量，其次从 .env 文件读取
 ALIYUN_API_KEY = _load_api_key()
 
-# 默认模型
-DEFAULT_MODEL = os.environ.get("ALIYUN_MODEL", "qwen-plus")
-
 # 兼容端点（标准）；北京地域业务空间请用 DASHSCOPE_BASE_URL 覆盖
 BASE_URL = os.environ.get(
     "DASHSCOPE_BASE_URL",
@@ -73,7 +70,7 @@ def _get_client() -> OpenAI:
 def aliyun_chat(
     system: str,
     user: str,
-    model: str = DEFAULT_MODEL,
+    model: str,
     temperature: float = 0.0,
     enable_thinking: bool | None = None,
 ) -> str:

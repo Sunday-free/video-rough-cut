@@ -45,9 +45,6 @@ def _load_api_key_from_env() -> str:
 # API Key：优先环境变量，其次从 .env 文件读取
 DEEPSEEK_API_KEY = _load_api_key_from_env()
 
-# 默认模型
-DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-
 # 超时（秒）
 REQUEST_TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "180"))
 
@@ -69,7 +66,7 @@ def _get_client() -> OpenAI:
 def deepseek_chat(
     system: str,
     user: str,
-    model: str = DEFAULT_MODEL,
+    model: str,
     temperature: float = 0.0,
     enable_thinking: bool | None = None,
 ) -> str:

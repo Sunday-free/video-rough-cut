@@ -33,7 +33,8 @@ def match_script_position(
     min_ratio: float = 0.4,
     expected_pos: float | None = None,
     lower: int | None = None,
-) -> int:
+    debug: bool = False,
+):
     """在原文稿中查找 text 的最佳匹配位置，返回字符偏移，-1 未找到。
 
     expected_pos: 期望匹配中心（字符偏移）。当存在多个候选（文本在原文稿中
@@ -41,14 +42,22 @@ def match_script_position(
         利用句子在原稿中的先后顺序消歧（第 idx 句大致出现在 idx/总句数 处）。
     lower: 软下界（字符偏移）。候选位置不得小于 lower，用于保证「后句必在前句
         之后」。若满足该约束的候选为空，则放宽回全部候选，避免彻底定位不到。
+    debug: 为 True 时返回 (pos, info_dict) 而非仅 int，便于诊断每层匹配结果。
     """
+    info: dict = {"layers": [], "chosen": None}
     candidates: list[int] = []
+
+    def _ret(pos):
+        if debug:
+            return pos, info
+        return pos
 
     # 1) 精确子串匹配：收集所有出现位置（文本可能重复出现）
     pos = script.find(text)
     while pos >= 0:
         candidates.append(pos)
         pos = script.find(text, pos + 1)
+    info["layers"].append(("1_exact", list(candidates)))
 
     # 2) 候选去标点再匹配（应对 ASR/口播稿标点差异）
     if not candidates:
@@ -57,6 +66,7 @@ def match_script_position(
         while p >= 0:
             candidates.append(p)
             p = script.find(clean, p + 1)
+        info["layers"].append(("2_depunct", list(candidates)))
 
     # 2.5) 双向去标点匹配：原稿也去标点后再找，应对【原稿内部标点差异】
     #      （如原稿「二、人工智能、新能源车」vs 候选「二人工智能新能源车」——
@@ -71,6 +81,7 @@ def match_script_position(
                 if orig >= 0:
                     candidates.append(orig)
                 p = clean_script.find(clean, p + 1)
+        info["layers"].append(("2.5_both_depunct", list(candidates)))
 
     # 2.6) 候选【前缀】匹配：口播/残句常与原文稿仅【前缀】一致（后半改写或截断，
     #      如候选「…也是接下来的」vs 原稿「…也是接下来我们要…」），整串匹配不到。
@@ -88,43 +99,79 @@ def match_script_position(
                         if orig >= 0:
                             candidates.append(orig)
                         p = clean_script.find(pref, p + 1)
+                    info["2.6_prefix"] = pref
                     break
+        info["layers"].append(("2.6_prefix", list(candidates)))
 
-    # 3) 模糊匹配：用 difflib 找「最大连续匹配块」作为锚点
-    #    口语与原稿有差异时长句会散出多块，必须取【最大块】而非「最接近估算点」，
-    #    否则会误锚到凑巧靠近的无关片段，导致窗口左/右边界错位（左邻居被截断）。
+    # 3) 模糊匹配：锚点投票 + 对齐相似度打分（通用，无需任何字符级特殊映射）
+    #    原理：difflib 的每个匹配块 (a, b, size) 表示 script[a:a+size]==text[b:b+size]。
+    #    若整句对齐到原稿起点 S，则该块满足 a-b≈S。字符「替换」（异体字/口误/谐音，
+    #    如口播「响」↔原稿「喺」）是等长替换，不改变 a-b 偏移；口语填充词造成的「插入」
+    #    只会让 a-b 轻微漂移。因此：
+    #      (1) 把每个块隐含的句首 S=a-b 收作候选起点；
+    #      (2) 对每个候选起点，用 script[S:S+len(text)] 与 text 的真实对齐相似度打分；
+    #      (3) 取相似度最高者为锚点（并列时用顺序约束 lower 与期望位 expected_pos 消歧）。
+    #    这样即使句中若干字被替换/漏读，剩余匹配块仍会共同指向同一真实起点，
+    #    天然容忍粤语异体字与口误，而无需维护「响→喺」之类的硬编码词表。
     if not candidates:
-        s = difflib.SequenceMatcher(None, script, text)
-        blocks = s.get_matching_blocks()
-        good = [b for b in blocks if b.size >= max(2, int(len(text) * min_ratio))]
-        if not good:
-            return -1
-        # 顺序约束：优先满足「后句必在前句之后」（仅当存在满足约束的块时生效）
-        if lower is not None:
-            after = [b for b in good if b.a >= lower]
-            if after:
-                good = after
-        # 主选最大连续匹配块；并列时取最接近 expected_pos 者
-        best = max(
-            good,
-            key=lambda b: (b.size, -abs(b.a - expected_pos) if expected_pos is not None else 0),
+        # autojunk=False：关闭「高频字符当 junk」启发式。原稿 >200 字符时 difflib
+        # 默认会把出现 >1% 的常用字（的/一/不/是…）判为 junk 不参与匹配，导致对齐
+        # 相似度被系统性压低、含大量常用字的句子更容易被误判为匹配不足而丢锚。中文
+        # 场景下必须关掉，否则锚点召回率下降、窗口退化成整篇原稿。
+        sm = difflib.SequenceMatcher(None, script, text, autojunk=False)
+        blocks = [b for b in sm.get_matching_blocks() if b.size >= 2]
+        if not blocks:
+            return _ret(-1)
+        cand_starts: set[int] = set()
+        for b in blocks:
+            s0 = b.a - b.b
+            cand_starts.add(s0 if s0 >= 0 else b.a)
+
+        def _score(S: int) -> float:
+            seg = script[S:S + len(text)]
+            return difflib.SequenceMatcher(None, seg, text, autojunk=False).ratio()
+
+        scored = [(S, _score(S)) for S in cand_starts if 0 <= S < len(script)]
+        if not scored:
+            return _ret(-1)
+
+        def _key(item: tuple[int, float]):
+            S, r = item
+            after = 1 if (lower is None or S >= lower) else 0
+            near = -abs(S - expected_pos) if expected_pos is not None else 0
+            # 相似度优先（量化到 3 位小数使近似并列可比），再看顺序约束，最后靠期望位
+            return (round(r, 3), after, near)
+
+        best_S, best_r = max(scored, key=_key)
+        info["layers"].append(
+            ("3_fuzzy", sorted(scored, key=lambda x: -x[1])[:5])
         )
-        return best.a
+        # 可靠性：最佳对齐相似度达到阈值即认为起点可信（供锚点/邻居筛选使用）
+        info["fuzzy_is_prefix"] = best_r >= min_ratio
+        info["chosen"] = ("3_fuzzy", best_S)
+        return _ret(best_S)
 
     if not candidates:
-        return -1
+        return _ret(-1)
 
     # 顺序约束：优先满足「在后句之前已定位句之后」（精确/去标点匹配走此路径）
     if lower is not None:
         after = [p for p in candidates if p >= lower]
         if after:
             candidates = after
+        else:
+            # lower 约束下无候选：不静默返回最早候选（会跳回前段），
+            # 改为交给下方「多候选就近消歧」按 expected_pos 选。
+            info["lower_failed"] = True
 
     # 多候选就近消歧（依赖句子顺序的期望位置）
     if expected_pos is not None and len(candidates) > 1:
-        return min(candidates, key=lambda p: abs(p - expected_pos))
+        chosen = min(candidates, key=lambda p: abs(p - expected_pos))
+        info["chosen"] = ("nearest_expected", chosen)
+        return _ret(chosen)
 
-    return candidates[0]
+    info["chosen"] = ("first", candidates[0])
+    return _ret(candidates[0])
 
 
 def build_org_window(
@@ -149,16 +196,13 @@ def build_org_window(
         if pos >= 0:
             matched.append((idx, text, pos, True))
             lower = pos + len(text)  # 下一句不得早于本句结束
-        elif expected is not None and expected > 0:
-            # 文本匹配失败（ASR 噪音/口误），先用 idx 估算原稿位置占位；
-            # 真正定位交给下方 focus 兜底：用前后已匹配邻居句插值。
-            est = int(expected)
-            if lower is not None and est < lower:
-                est = lower  # 不早于已定位的前句
-            matched.append((idx, text, est, False))
-            lower = est + len(text)
+        # 匹配失败（ASR 噪音 / 口误 / 口播跑题）：不再用 idx/总句数 退化估算位置
+        # （旧逻辑会把窗口锚到与原稿毫不相干的「同序号附近」片段，误导 LLM）。
+        # 该句直接放弃定位，交由下方「无任何真实匹配 → 返回完整原稿」兜底。
     if not matched:
-        return None
+        # 所有 involved 句均未能在原稿定位（五层匹配全失败）：不猜测位置，
+        # 直接返回完整原稿，交由 LLM 自行对照全文。
+        return script
 
     min_pos = min(p for _, _, p, _ in matched)
     max_pos = max(p for _, _, p, _ in matched)
@@ -212,9 +256,29 @@ def build_org_window(
     protect = focus_idx is not None
 
     # ── 以问题句为中心、左右均衡截取 ─────────────────────────────────────
-    # 窗口以 focus 为中心各取半窗（half = max_window//2），并向句末标点对齐；
-    # 对齐只允许在「半窗范围内」扩展、绝不越过 focus±half，从而保证问题句居中；
-    # 最后强制平衡（两侧扩展等长、上限 half），左右用「…」收尾。
+    return _window_around_center(
+        script, focus, max_window=max_window,
+        p_start=p_start, p_end=p_end, protect=protect,
+    )
+
+
+def _window_around_center(
+    script: str,
+    focus: int,
+    max_window: int = 100,
+    p_start: int = 0,
+    p_end: int = 0,
+    protect: bool = False,
+) -> str:
+    """以 focus 为中心向两侧均衡截取原文稿窗口，对齐句末标点，加 … 收尾。
+
+    窗口以 focus 为中心各取半窗（half = max_window//2），并向句末标点对齐；
+    对齐只允许在「半窗范围内」扩展、绝不越过 focus±half，从而保证焦点居中；
+    最后强制平衡（两侧扩展等长、上限 half），左右用「…」收尾。
+
+    protect / p_start / p_end：当保护问题句本体（focus_idx 明确传入）时，窗口
+    两侧不得切入 [p_start, p_end]（问题句本体）。
+    """
     _SENT_END = set("。！？")
     half = max_window // 2
 
@@ -284,6 +348,9 @@ def build_short_org_window(
     involved = [n for n in (left, right) if n is not None]
     if not involved:
         return None
+    # 降级用左右长邻居同时定位时，故意**不受 dyn_max 控制**（不传 max_window）：
+    # 该路径旨在用两侧邻居把问题句夹出来，窗口应自由覆盖到左、右邻居的真实落点，
+    # 而非被 full 路径的 dyn_max=max(50, 最长句*2) 截断。
     return build_org_window(script, involved, n_sentences=len(sentences))
 
 
@@ -312,6 +379,95 @@ def _strip_nl(s: str | None) -> str | None:
     if s is None:
         return None
     return s.replace("\n", "").replace("\r", "")
+
+
+def _build_anchors(script: str, sentences: list) -> dict:
+    """为每句在原稿中做高置信匹配，返回 {idx: pos}（pos = 该句在原稿中的起点）。
+
+    仅接受「起点可靠」的匹配：
+      - 精确 / 去标点 / 双向去标点 / 前缀匹配：均以句首为锚，起点即真实起点；
+      - 模糊匹配中「从口播句开头命中」(b.b == 0, size>=4) 的块：起点可靠；
+      - 模糊匹配中仅中段片段命中 (b.b > 0) 的块：起点不对应句子开头，不可信，拒绝。
+    最后做单调性过滤：按 idx 升序要求 pos 非递减（原稿保持句序），剔除乱序错锚。
+    """
+    anchors: dict = {}
+    for s in sentences:
+        idx = s.get("idx")
+        t = (s.get("text") or "").strip()
+        if not t or len(t) <= 2:
+            continue
+        # expected_pos 按句序估算（idx/总句数 × 原稿长度），用于在文本于原稿中
+        # 多处重复出现时就近消歧（如口头禅同时出现在句 5 与句 80），避免错锚到
+        # 最早出现处；同时作为模糊层并列时的次序 tiebreaker。
+        expected = (idx / len(sentences) * len(script)) if sentences else None
+        pos, info = match_script_position(
+            script, t, expected_pos=expected, debug=True,
+        )
+        if pos < 0:
+            continue
+        chosen = info.get("chosen")
+        layer = chosen[0] if chosen else None
+        # 模糊层接受条件：最佳对齐相似度达到阈值即认为起点可信（fuzzy_is_prefix 现
+        # 语义= best_r >= min_ratio，而非旧版的「必须从句首命中 b.b==0」）。即便命中
+        # 块位于句中（b.b>0），只要整段对齐相似度够高，投票+打分已把候选起点收敛到
+        # 真实的句首 S，起点依然可靠，故此处仅以相似度阈值把关，不再额外要求前缀块。
+        if layer == "3_fuzzy" and not info.get("fuzzy_is_prefix"):
+            continue
+        # 其余（精确 / 去标点 / 双向去标点 / 前缀匹配 → chosen 标签为 'first'，
+        # 或模糊匹配中从句首命中的前缀块）起点均可靠，作为锚点。
+        anchors[idx] = pos
+
+    # 单调性过滤：原稿保持句序，故 pos 应随 idx 非递减。用「最长非降子序列(LIS)」
+    # 取最大的一致锚点链，剔除离群错锚——关键：单个残句错锚（如短残句「哎呀呢度」的
+    # 「呢度」凑巧命中原稿结尾）只是链外离群点，会被 LIS 排除，而不会像贪心过滤那样
+    # 污染 last 值、把它之后所有正确锚点连带丢弃。
+    items = sorted(anchors.items())  # [(idx, pos), ...] 按 idx 升序
+    n = len(items)
+    if n == 0:
+        return {}
+    dp = [1] * n          # dp[i]: 以 i 结尾的最长非降链长度
+    prev = [-1] * n
+    for i in range(n):
+        for j in range(i):
+            if items[j][1] <= items[i][1] and dp[j] + 1 > dp[i]:
+                dp[i] = dp[j] + 1
+                prev[i] = j
+    best_i = max(range(n), key=lambda i: dp[i])
+    keep: set[int] = set()
+    k = best_i
+    while k != -1:
+        keep.add(k)
+        k = prev[k]
+    return {items[i][0]: items[i][1] for i in range(n) if i in keep}
+
+
+def _window_for_focus(
+    script: str,
+    anchors: dict,
+    focus_idx: int,
+    focus_text: str = "",
+) -> str:
+    """用已匹配的最近左/右邻居把焦点句夹在中间，取中心截窗口。
+
+    焦点句自身能高置信匹配 → 以自身匹配点为窗口中心；
+    否则取「最近左邻居起点」与「最近右邻居起点」之间中点为中心。
+    窗口半径按句长自适应。
+    """
+    focus = anchors.get(focus_idx)
+    left_idx = max((i for i in anchors if i < focus_idx), default=None)
+    right_idx = min((i for i in anchors if i > focus_idx), default=None)
+    if focus is not None:
+        center = focus
+    elif left_idx is not None and right_idx is not None:
+        center = (anchors[left_idx] + anchors[right_idx]) // 2
+    elif left_idx is not None:
+        center = anchors[left_idx] + max(30, len(focus_text) // 2)
+    elif right_idx is not None:
+        center = anchors[right_idx] - max(30, len(focus_text) // 2)
+    else:
+        return script  # 无任何锚点，退回整篇
+    max_window = max(90, len(focus_text) * 2) if focus_text else 150
+    return _window_around_center(script, center, max_window=max_window)
 
 
 def get_org_script_window(
@@ -352,32 +508,61 @@ def get_org_script_window(
         involved = _involved_from_finding(finding)
         if not involved:
             return None
-        # 补充前后邻居句辅助定位：当前句文本可能为 ASR 噪音无法匹配原稿，
-        # 但邻居句可以匹配，通过邻居句在原稿中的位置间接定位当前句。
+        # 单句焦点（明确给了 focus_idx）：用「全体句子高置信锚点 + 最近左/右邻居夹窗」
+        # 定位——稳健且不受焦点句自身能否匹配影响（即使焦点句是残句/口误，只要左右邻居
+        # 正确匹配，窗口就落在正确段落）。多句比对（未给 focus_idx）才走下方旧逻辑。
+        if focus_idx is not None:
+            anchors = _build_anchors(script, sentences)
+            focus_text = (finding.get("text") or "").strip()
+            return _strip_nl(_window_for_focus(script, anchors, focus_idx, focus_text))
+        # 多句比对：补充前后邻居句辅助定位。当前句文本可能为 ASR 噪音无法匹配原稿，
+        # 但（未被改写的）邻居句可以匹配，通过它的原稿位置间接定位当前句。
+        # 邻居若被污染（五层匹配全失败，或非前缀模糊错锚）则跳过，继续向外找最近的可匹配邻居；
+        # 每侧最多找 NEIGHBOR_DEPTH 层。若两侧都找不到可匹配邻居，
+        # 则该 finding 在 build_org_window 中 matched 为空 → 退化返回完整原稿。
         involve_set = {i for i, _ in involved}
         sent_idx_map = {s["idx"]: (s.get("text", "") or "").strip() for s in sentences}
         _sorted = sorted(involved, key=lambda x: x[0])
         min_i, max_i = _sorted[0][0], _sorted[-1][0]
         max_sid = max(sent_idx_map.keys()) if sent_idx_map else max_i
-        # 向左取最近的非空邻居（>2字）
-        i = min_i - 1
-        while i >= 0:
-            t = sent_idx_map.get(i, "")
-            if t and i not in involve_set and len(t) > 2:
-                involved.append((i, t))
-                involve_set.add(i)
-                break
-            i -= 1
-        # 向右取最近的非空邻居（>2字）
-        i = max_i + 1
-        while i <= max_sid:
-            t = sent_idx_map.get(i, "")
-            if t and i not in involve_set and len(t) > 2:
-                involved.append((i, t))
-                involve_set.add(i)
-                break
-            i += 1
-        dyn_max = max(50, max(len(t) for _, t in involved) * 2)
+        NEIGHBOR_DEPTH = 3
+        # 焦点期望位置：用于过滤「匹配到了但定位离焦点过远」的误锚邻居
+        # （如被污染的短句 fuzzy 命中到原稿另一端），避免把窗口拽到毫不相干的位置。
+        focus_expected = (min_i / len(sentences) * len(script)) if sentences else None
+        pos_tol = int(len(script) * 0.3)
+
+        def _pick_matching_neighbor(start: int, step: int) -> tuple[int, str] | None:
+            """从 start 沿 step 方向向外找最近一个「能匹配原稿且定位邻近焦点」的邻居（>2字）。
+            被污染的邻居（匹配不到 / 非前缀模糊错锚 / 定位离焦点过远）直接跳过，继续向外；
+            最多找 NEIGHBOR_DEPTH 层。
+            """
+            for _ in range(NEIGHBOR_DEPTH):
+                start += step
+                if start < 0 or start > max_sid:
+                    return None
+                t = sent_idx_map.get(start, "")
+                if t and start not in involve_set and len(t) > 2:
+                    pos, info = match_script_position(script, t, debug=True)
+                    if pos < 0:
+                        continue  # 邻居被污染（匹配不到）：跳过，向外找下一层
+                    if info.get("chosen") and info["chosen"][0] == "3_fuzzy" \
+                            and not info.get("fuzzy_is_prefix"):
+                        continue  # 非前缀模糊块起点不可信：跳过
+                    if focus_expected is not None and abs(pos - focus_expected) > pos_tol:
+                        # 匹配到了，但定位离焦点期望位置过远 → 视为误锚，跳过
+                        continue
+                    return start, t
+            return None
+
+        pick = _pick_matching_neighbor(min_i, -1)
+        if pick:
+            involved.append(pick)
+            involve_set.add(pick[0])
+        pick = _pick_matching_neighbor(max_i, 1)
+        if pick:
+            involved.append(pick)
+            involve_set.add(pick[0])
+        dyn_max = max(60, max(len(t) for _, t in involved) * 2)
         return _strip_nl(build_org_window(
             script, involved, n_sentences=len(sentences), max_window=dyn_max,
             focus_idx=focus_idx,

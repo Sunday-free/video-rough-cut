@@ -156,7 +156,10 @@ def _entry_indices(entry: dict) -> tuple[str | None, list[tuple[int, int]]]:
 
     # V3 读稿错误检测：dimension=misread，归并到独立「误读(misread)」tab。
     #   resay（残句重说）整句删 → 用整句 range。
+    #   report（数值/事实出入）仅报告、不删 → 不标字，归「report」类（独立 tab）。
     if typ == "misread":
+        if det.get("subtype") == "report":
+            return "report", []
         r = _parse_range(det.get("range"))
         return "misread", ([r] if r else [])
 
@@ -247,23 +250,56 @@ def _build_word_categories(analysis_dir: Path) -> dict[int, str]:
     # 按优先级分类后逐类标注（先精确/具体，first-wins）
     # 归并映射在 _entry_indices 内完成：partial→句间重复；misread(resay)→误读。
     buckets: dict[str, list[list[tuple[int, int]]]] = {
-        "intra_repeat": [], "fragment": [], "inter_repeat": [], "misread": [],
+        "intra_repeat": [], "fragment": [], "inter_repeat": [], "misread": [], "report": [],
     }
     for e in applied:
         typ, ranges = _entry_indices(e)
         if typ in buckets and ranges:
             buckets[typ].append(ranges)
 
-    for typ in ("intra_repeat", "fragment", "inter_repeat", "misread"):
+    for typ in ("intra_repeat", "fragment", "inter_repeat", "misread", "report"):
         for ranges in buckets[typ]:
             mark(ranges, typ)
 
     return cats
 
 
+def _collect_report_items(analysis_dir: Path) -> list[dict]:
+    """收集 V3「仅报告」类决策（subtype=report / action=report），供 review 页「报告」tab 展示。
+
+    数据来源：detect_agent 的 review_loop_decisions.json 中 decision.action == "report" 的条目。
+    """
+    loop_p = detect_agent_dir(analysis_dir) / "review_loop_decisions.json"
+    if not loop_p.exists():  # 兼容旧数据（曾放在 analysis_dir 根）
+        loop_p = analysis_dir / "review_loop_decisions.json"
+    if not loop_p.exists():
+        return []
+    try:
+        data = json.loads(loop_p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items: list[dict] = []
+    for e in data if isinstance(data, list) else []:
+        if not isinstance(e, dict):
+            continue
+        dec = e.get("decision", {}) or {}
+        if dec.get("action") != "report":
+            continue
+        det = e.get("detect", {}) or {}
+        items.append({
+            "sentence_idx": det.get("sentence_idx"),
+            "range": det.get("range"),
+            "text": det.get("text", ""),
+            "spoken": det.get("spoken", ""),
+            "expected": det.get("expected", ""),
+            "error_text": det.get("error_text", ""),
+        })
+    return items
+
+
 def _generate_review_html(
     words_json: Path, review_auto: Path, video: Path, review_dir: Path,
-    categories_json: Path | None = None,
+    categories_json: Path | None = None, report_json: Path | None = None,
 ) -> None:
     """调用 generate_review.js 生成 review.html（需要 node）。"""
     gen_script = _THIS_DIR / "generate_review.js"
@@ -277,6 +313,8 @@ def _generate_review_html(
                str(video.resolve())]
         if categories_json is not None:
             cmd.append(str(categories_json.resolve()))
+        if report_json is not None:
+            cmd.append(str(report_json.resolve()))
         subprocess.run(cmd, cwd=str(review_dir), check=True)
         print(f"  已生成: review.html（含预选 {len(json.loads(review_auto.read_text(encoding='utf-8')))} 项）")
     except subprocess.CalledProcessError as e:
@@ -428,6 +466,14 @@ def run_review(
           f"残句 {_cat_stat['fragment']} / "
           f"误读 {_cat_stat['misread']} 词）")
 
+    # --- 仅报告项（数值/事实出入，report 类型，供「报告」tab 展示）---
+    report_items = _collect_report_items(analysis_dir)
+    report_json = review_dir / "report_items.json"
+    report_json.write_text(
+        json.dumps(report_items, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"  已写入: {report_json.name}（仅报告 {len(report_items)} 项）")
+
     # --- 视频文件 ---
     video = Path(video_file) if video_file else _find_video(base_dir)
     if not video or not video.exists():
@@ -436,7 +482,8 @@ def run_review(
     print(f"  视频: {video}")
 
     # --- 生成 review.html ---
-    _generate_review_html(words_json, review_auto, video, review_dir, categories_json)
+    _generate_review_html(words_json, review_auto, video, review_dir,
+                          categories_json, report_json)
 
     if not serve:
         print(f"\n✅ 审核目录已准备: {review_dir}")

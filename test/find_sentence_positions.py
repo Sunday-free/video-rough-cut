@@ -22,7 +22,7 @@ if _ROOT not in sys.path:
 from speech_error_detector.utils.sentence_io import load_sentences
 from speech_error_detector.detect_repeat.script_window import get_org_script_window
 
-base = "2026-07-07_福总"
+base = "2026-07-07_man姐"
 _SENT_REL = f"{base}/2_分析/sentences_origin.txt"
 _SCRIPT_REL = f"{base}/original_script.txt"
 _OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_output")

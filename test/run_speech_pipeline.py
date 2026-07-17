@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from speech_error_detector.speech_pipeline import run_pipeline
 from speech_error_detector.server.review_entry import run_review
-from speech_error_detector.ai.chat import DEFAULT_MODEL
+from speech_error_detector.ai.chat import DEFAULT_MODEL, SUPPORTED_MODELS
 from speech_error_detector.utils.compare_truth import compare_with_truth
 
 
@@ -27,12 +27,12 @@ dirs = [
     {"dir": "2026-07-07_红姐", "language": "zh-CN"},
     {"dir": "2026-07-07_man姐", "language": "zh-CN"},
 ]
-RUN_INDEX = 1   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
+RUN_INDEX = 2   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
 SILENCE_THRESH = 0.9
 # 删除静音时保留的句间呼吸感时长（秒）。
 SILENCE_KEEP_DURATION = 0.5
 DETECT_AGENT_MODEL = DEFAULT_MODEL                       # 循环审查 Agent (detect_agent) 默认模型
-DETECT_REPEAT_MODEL = "deepseek-v4-pro"      # 机械检测 (detect_repeat) 用 DeepSeek pro
+DETECT_REPEAT_MODEL = SUPPORTED_MODELS.QWEN_3_7_PLUS     # 机械检测 (detect_repeat) 用 DeepSeek pro
 # MODEL = "deepseek-chat"
 VIDEO_DURATION = 0.0
 ENABLE_DEEPSEEK_THINKING = False    # 关闭 DeepSeek 思考模式（加速）
@@ -42,7 +42,7 @@ SKIP_JUDGE = False
 SKIP_LOOP = False
 SKIP_REVIEW = False
 MAX_DET_ROUNDS = 5
-MAX_LOOP_ROUNDS = 5
+MAX_LOOP_ROUNDS = 3
 REVIEW_SERVE = True
 COMPARE_WITH_TRUTH = True     # pipeline 跑完后与原始口播 sentences.txt 比对误删/漏删
 

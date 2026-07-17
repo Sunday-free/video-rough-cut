@@ -14,6 +14,7 @@ const subtitlesFile = process.argv[2] || 'subtitles_words.json';
 const autoSelectedFile = process.argv[3] || 'auto_selected.json';
 const videoFile = process.argv[4] || 'video.mp4';
 const categoriesFile = process.argv[5] || 'word_categories.json';
+const reportFile = process.argv[6] || 'report_items.json';
 
 // 创建视频文件的符号链接到当前目录（避免复制大文件）
 const videoBaseName = 'video.mp4';
@@ -49,6 +50,17 @@ if (fs.existsSync(categoriesFile)) {
     console.log('错误类型映射:', Object.keys(wordCategories).length, '个词');
   } catch (e) {
     console.warn('⚠️ 解析 word_categories.json 失败，类型计数将为 0');
+  }
+}
+
+// 仅报告项（数值/事实出入，V3 report 类型），由 review_entry.py 生成
+let reportItems = [];
+if (fs.existsSync(reportFile)) {
+  try {
+    reportItems = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+    console.log('报告项:', reportItems.length, '条');
+  } catch (e) {
+    console.warn('⚠️ 解析 report_items.json 失败，报告 tab 为空');
   }
 }
 
@@ -471,6 +483,79 @@ const html = `<!DOCTYPE html>
       max-width: unset;
     }
 
+    /* Report panel（仅报告：数值/事实出入） */
+    .report-panel {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 24px 60px;
+    }
+    .report-tip {
+      background: var(--bg-muted, #2a2a33);
+      border: 1px solid var(--divider, #3a3a44);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: var(--text-faint, #9aa);
+      margin-bottom: 16px;
+    }
+    .report-card {
+      background: var(--bg-card, #22222a);
+      border: 1px solid var(--divider, #3a3a44);
+      border-left: 3px solid #e0a64a;
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+    }
+    .report-head {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-strong, #eee);
+      margin-bottom: 6px;
+    }
+    .report-range {
+      font-family: var(--font-mono);
+      font-weight: 400;
+      color: var(--text-faint, #9aa);
+      margin-left: 6px;
+    }
+    .report-text {
+      font-size: 14px;
+      color: var(--text, #ddd);
+      margin-bottom: 8px;
+      line-height: 1.7;
+    }
+    .report-diff {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+    .report-diff .bad {
+      background: rgba(224,107,107,0.15);
+      color: #f08080;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .report-diff .good {
+      background: rgba(104,195,163,0.15);
+      color: #68c3a3;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .report-diff .arrow { color: var(--text-faint, #9aa); }
+    .report-note {
+      font-size: 13px;
+      color: var(--text-faint, #9aa);
+      line-height: 1.6;
+    }
+    .report-empty {
+      color: var(--text-faint, #9aa);
+      font-size: 14px;
+      padding: 20px 0;
+    }
+
     /* Chapter header */
     .chapter-header {
       display: flex;
@@ -861,6 +946,7 @@ const html = `<!DOCTYPE html>
         <button class="filter-btn" data-filter="inter_repeat" onclick="setFilter('inter_repeat',this)">句间重复 <span id="fInter">0</span></button>
         <button class="filter-btn" data-filter="intra_repeat" onclick="setFilter('intra_repeat',this)">句内重复 <span id="fIntra">0</span></button>
         <button class="filter-btn" data-filter="misread" onclick="setFilter('misread',this)">误读 <span id="fMisread">0</span></button>
+        <button class="filter-btn" data-filter="report" onclick="setFilter('report',this)">报告 <span id="fReport">0</span></button>
         <span class="filter-summary">已选 <span id="selCount">0</span> / <span id="totalCount">0</span></span>
       </div>
 
@@ -882,6 +968,12 @@ const html = `<!DOCTYPE html>
         <div class="content" id="content"></div>
       </div>
 
+      <!-- Report panel（仅报告：数值/事实出入，不进删除流程） -->
+      <div class="report-panel" id="reportPanel" style="display:none">
+        <div class="report-tip">以下为「数值 / 事实出入」类问题（如口播数字与原稿不一致）。本系统只能删不能改，故仅作报告、不自动删除，由你自行决定改 / 留。</div>
+        <div id="reportList"></div>
+      </div>
+
       <!-- Bottom legend -->
       <div class="bottom-legend">
         <div class="legend-item"><span class="legend-swatch del">删除</span><span>已选中</span></div>
@@ -899,6 +991,8 @@ const html = `<!DOCTYPE html>
     const selected = new Set(autoSelected);
     // 字级索引 → 错误类型（inter_repeat/intra_repeat/fragment/misread），由 review_entry.py 生成
     const wordCategories = ${JSON.stringify(wordCategories)};
+    // 仅报告项（数值/事实出入，V3 report 类型），由 review_entry.py 生成
+    const reportItems = ${JSON.stringify(reportItems)};
 
     // 自动保存状态（必须在 rebuildSkipIntervals 之前声明，否则 TDZ）
     let saveTimer = null;
@@ -1194,6 +1288,7 @@ const html = `<!DOCTYPE html>
       document.getElementById('fIntra').textContent = counts.intra_repeat;
       document.getElementById('fFragment').textContent = counts.fragment;
       document.getElementById('fMisread').textContent = counts.misread;
+      document.getElementById('fReport').textContent = reportItems.length;
     }
 
     // ─── Filter ───
@@ -1235,6 +1330,21 @@ const html = `<!DOCTYPE html>
 
       clearFilterHighlight();
 
+      // 报告 tab：切换显示报告面板 / 转录正文
+      const reportPanel = document.getElementById('reportPanel');
+      const transcriptBody = document.getElementById('transcriptBody');
+      if (type === 'report') {
+        reportPanel.style.display = '';
+        transcriptBody.style.display = 'none';
+        document.getElementById('searchInput').style.visibility = 'hidden';
+        renderReportPanel();
+        return;
+      } else {
+        reportPanel.style.display = 'none';
+        transcriptBody.style.display = '';
+        document.getElementById('searchInput').style.visibility = '';
+      }
+
       if (type === 'all') {
         // 显示所有
         elements.forEach(el => { if (el) el.style.display = ''; });
@@ -1244,6 +1354,33 @@ const html = `<!DOCTYPE html>
 
       // 高亮该类型对应字（选中框常亮，不再 3 秒后清除）
       applyFilterHighlight(true);
+    }
+
+    function escapeHtml(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function renderReportPanel() {
+      const list = document.getElementById('reportList');
+      if (!reportItems.length) {
+        list.innerHTML = '<div class="report-empty">✅ 暂无需要报告的数值 / 事实出入。</div>';
+        return;
+      }
+      list.innerHTML = reportItems.map(function(it) {
+        return ''
+          + '<div class="report-card">'
+          +   '<div class="report-head">句' + escapeHtml(it.sentence_idx)
+          +     ' <span class="report-range">' + escapeHtml(it.range || '') + '</span></div>'
+          +   '<div class="report-text">「' + escapeHtml(it.text) + '」</div>'
+          +   '<div class="report-diff">'
+          +     '<span class="bad">口播 ' + escapeHtml(it.spoken || '—') + '</span>'
+          +     '<span class="arrow">→</span>'
+          +     '<span class="good">原稿 ' + escapeHtml(it.expected || '—') + '</span>'
+          +   '</div>'
+          +   '<div class="report-note">' + escapeHtml(it.error_text || '') + '</div>'
+          + '</div>';
+      }).join('');
     }
 
     // ─── Search ───

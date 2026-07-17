@@ -316,6 +316,57 @@ def _make_decision_obj(
     }
 
 
+def _make_report_decision_obj(
+    iss: dict,
+    round_num: int,
+    current_sentences: list[dict],
+) -> dict:
+    """为「仅报告」类 issue（数值/事实出入）构建决策对象。
+
+    report 类型不进 confirm、不删除，直接记为 action="report"，
+    保留口播值/原稿值供 review 页「报告」tab 展示。
+    """
+    dim = iss.get("dimension", "misread")
+    sub = iss.get("subtype", "report")
+    sid = iss.get("sentence_idx")
+
+    target_range = "?"
+    target_text = ""
+    for s in current_sentences:
+        if s.get("idx") == sid:
+            target_range = s.get("range", "?")
+            target_text = s.get("text", "")
+            break
+
+    return {
+        "round": round_num,
+        "detect": {
+            "type": dim,
+            "subtype": sub,
+            "sent_idx": sid,
+            "range": target_range,
+            "text": target_text[:80] if len(target_text) > 80 else target_text,
+            "decision_hint": iss.get("error_text", ""),
+            "dimension": dim,
+            "severity": iss.get("severity", ""),
+            "sentence_idx": sid,
+            "error_text": iss.get("error_text", ""),
+            "delete_text": "",
+            "spoken": iss.get("spoken", ""),
+            "expected": iss.get("expected", ""),
+        },
+        "decision": {
+            "sentence": sid,
+            "action": "report",
+            "delete_text": "",
+            "confirmed": False,
+            "reason": iss.get("error_text", ""),
+            "llm_reason": iss.get("error_text", ""),
+        },
+        "action": "report",
+    }
+
+
 # ============================================================
 #  Step 4: 应用确认删除 + 落盘本轮句子
 # ============================================================
@@ -440,7 +491,7 @@ def _dedup_issues_cross_round(
     """跨轮去重：过滤 all_decisions 中已决策过的 sentence_idx（不论 confirmed 还是 rejected）。"""
     decided_sids: set[int] = set()
     for d in all_decisions:
-        iss = d.get("issue", {})
+        iss = d.get("issue") or d.get("detect") or {}
         sid = iss.get("sentence_idx")
         if sid is not None:
             decided_sids.add(int(sid))
@@ -524,51 +575,65 @@ def run_agent_review_loop_v3(
             sev = iss.get("severity", "?")
             sub = iss.get("subtype", iss.get("dimension"))
             sid = iss.get("sentence_idx", "?")
-            print(f"      [{sev}] #{i} {sub}: 句{sid}「{(iss.get('error_text') or '')[:40]}」")
+            tag = "📌" if sub == "report" else ""
+            print(f"      {tag}[{sev}] #{i} {sub}: 句{sid}「{(iss.get('error_text') or '')[:40]}」")
 
-        # === Step 2: Confirm（逐候选独立调用，与 judge 一致，消除批量一致性偏置）===
-        print(f"\n[Confirm V3] 正在逐条确认 {len(new_issues)} 个候选...")
-        verified = _run_verify(
-            loop_dir=loop_dir,
-            round_num=round_num,
-            new_issues=new_issues,
-            current_sentences=current_sentences,
-            model=model,
-            effective_script=_effective_script,
-            enable_thinking=enable_thinking,
-            stage="confirm_v3",
-        )
+        # === 分流：report（仅报告，跳过 confirm）vs deletable（进 confirm）===
+        report_issues = [iss for iss in new_issues if iss.get("subtype") == "report"]
+        deletable_issues = [iss for iss in new_issues if iss.get("subtype") != "report"]
 
-        # === Step 3: 合并 + 分流（删 / 保留）===
-        # detect 与 confirm 都给出 delete_text：confirm 校验 detect 的 delete_text 是否正确，
-        # 正确则留空（下游回退用 detect 的），有误则给真正的 delete_text。
-        # action=delete 且最终 delete_text 非空即确认删除；
-        # 整句删还是部分删由 apply 根据 delete_text 与整句关系确定性判定。
-        round_confirmed: list[dict] = []
-        round_confirmed_objs: list[dict] = []  # 与 round_confirmed 平行，指向 all_decisions 中对应决策对象
-        for i, iss in enumerate(new_issues):
-            v = verified[i] if i < len(verified) else {
-                "index": i, "action": "keep", "delete_text": "", "reason": "无验证结果",
-            }
-            obj = _make_decision_obj(iss, v, round_num, current_sentences)
+        # report 类：直接记入决策（action="report"，不删、不进确认）
+        for iss in report_issues:
+            obj = _make_report_decision_obj(iss, round_num, current_sentences)
             all_decisions.append(obj)
-            action = v.get("action", "delete")
-            # detect 原始 delete_text
-            detect_delete = (iss.get("delete_text") or "").strip()
-            # confirm 给出的 delete_text（可能留空表示信任 detect）
-            confirm_delete = (v.get("delete_text") or "").strip()
-            # 生效 delete_text：confirm 留空 → 用 detect 的；否则用 confirm 纠正后的
-            delete_text = confirm_delete if confirm_delete else detect_delete
-            # 打印 detect 与 confirm 的 delete_text
-            if action == "delete" and delete_text:
-                aug = dict(iss)
-                aug["delete_text"] = delete_text  # confirm 留空时用 detect 的；否则用 confirm 纠正后的
-                aug["delete_reason"] = v.get("reason", "")  # 传给 apply 用于多匹配消歧（开头/前半→首部）
-                round_confirmed.append(aug)
-                round_confirmed_objs.append(obj)
-                print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]} ｜最终待删='{delete_text}'")
-            else:
-                print(f"      ❌ #{i} 保留: {v.get('reason', '')[:60]}")
+            print(f"      📌 仅报告(report): 句{iss.get('sentence_idx', '?')} "
+                  f"「{(iss.get('error_text') or '')[:50]}」")
+
+        # === Step 2: Confirm（仅 deletable 类逐候选独立调用）===
+        verified: list[dict] = []
+        round_confirmed: list[dict] = []
+        round_confirmed_objs: list[dict] = []
+        if deletable_issues:
+            print(f"\n[Confirm V3] 正在逐条确认 {len(deletable_issues)} 个候选...")
+            verified = _run_verify(
+                loop_dir=loop_dir,
+                round_num=round_num,
+                new_issues=deletable_issues,
+                current_sentences=current_sentences,
+                model=model,
+                effective_script=_effective_script,
+                enable_thinking=enable_thinking,
+                stage="confirm_v3",
+            )
+
+            # === Step 3: 合并 + 分流（删 / 保留）===
+            # detect 与 confirm 都给出 delete_text：confirm 校验 detect 的 delete_text 是否正确，
+            # 正确则留空（下游回退用 detect 的），有误则给真正的 delete_text。
+            # action=delete 且最终 delete_text 非空即确认删除；
+            # 整句删还是部分删由 apply 根据 delete_text 与整句关系确定性判定。
+            for i, iss in enumerate(deletable_issues):
+                v = verified[i] if i < len(verified) else {
+                    "index": i, "action": "keep", "delete_text": "", "reason": "无验证结果",
+                }
+                obj = _make_decision_obj(iss, v, round_num, current_sentences)
+                all_decisions.append(obj)
+                action = v.get("action", "delete")
+                # detect 原始 delete_text
+                detect_delete = (iss.get("delete_text") or "").strip()
+                # confirm 给出的 delete_text（可能留空表示信任 detect）
+                confirm_delete = (v.get("delete_text") or "").strip()
+                # 生效 delete_text：confirm 留空 → 用 detect 的；否则用 confirm 纠正后的
+                delete_text = confirm_delete if confirm_delete else detect_delete
+                # 打印 detect 与 confirm 的 delete_text
+                if action == "delete" and delete_text:
+                    aug = dict(iss)
+                    aug["delete_text"] = delete_text  # confirm 留空时用 detect 的；否则用 confirm 纠正后的
+                    aug["delete_reason"] = v.get("reason", "")  # 传给 apply 用于多匹配消歧（开头/前半→首部）
+                    round_confirmed.append(aug)
+                    round_confirmed_objs.append(obj)
+                    print(f"      ✅ #{i} 删除: {v.get('reason', '')[:60]} ｜最终待删='{delete_text}'")
+                else:
+                    print(f"      ❌ #{i} 保留: {v.get('reason', '')[:60]}")
 
         # 每轮合并完决策后立即落盘，便于观察中间过程
         _save_decisions_file(output_path, all_decisions)

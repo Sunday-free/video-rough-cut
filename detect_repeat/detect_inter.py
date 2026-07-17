@@ -2,7 +2,7 @@
 detect_inter.py — 句间重复机械检测（整句删除专用）
 
 检测策略（全部产出整句删除候选，删前保后）：
-1. 相邻句头前缀匹配 (head_eq >= 5字)
+1. 相邻句头容错匹配（N>=4 时前 N+2 字有 N 字相同、容忍 2 字；N<4 时必须一模一样）
 2. 隔句重复（中间是短残句）
 3. 子串完全包含（前句完全在後句内 → 前句为冗余残句）
 
@@ -18,13 +18,18 @@ from speech_error_detector.detect_repeat import CN_DIGIT_MAP, normalize_numerals
 from speech_error_detector.utils.fillers import MODAL_CHARS
 
 
-def head_eq(a: str, b: str, n: int = 5) -> int:
-    """计算两字符串的共同前缀长度（最多 n 字符），归一化数字后比较。"""
+def head_eq(a: str, b: str, n: int) -> int:
+    """句头匹配。
+    - n >= 4：容错模式 —— 前 (n+2) 字中有 n 字相同即视为重复（容忍最多 2 字差异）。
+    - n < 4 ：精确模式 —— 必须一模一样（前 n 字逐字全等，任何一字不同或长度不足即不命中）。
+    返回匹配字数（>= n 即命中）。"""
     na, nb = normalize_numerals(a), normalize_numerals(b)
-    k = 0
-    while k < n and k < len(na) and k < len(nb) and na[k] == nb[k]:
-        k += 1
-    return k
+    window = n + 2 if n >= 4 else n
+    m = min(window, len(na), len(nb))
+    matched = sum(1 for i in range(m) if na[i] == nb[i])
+    if n < 4 and matched != m:
+        return 0  # 精确模式：有一字不同即判不命中
+    return matched
 
 
 # 常见语气/停顿衬字：做"近重复"判定时忽略，避免 呢/呃 等差导致漏检。
@@ -46,7 +51,7 @@ def detect_inter(sentences: list[dict], original_script: str = "") -> list[dict]
         findings: 检测结果列表
     """
     findings = []
-    N = 5  # 最小前缀匹配长度
+    N = 5  # 最小前缀匹配长度（必须 > 4，且 >= 4 才进入容错模式）
     
     # 1. 相邻句头前缀重复
     for i in range(len(sentences) - 1):

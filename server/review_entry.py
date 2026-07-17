@@ -2,8 +2,8 @@
 review_entry.py — Review 审核环境入口。
 
 从 pipeline.py 抽离，包含：
-  - _find_video, _compute_preselect_set, _generate_review_html, _start_review_server
-  - run_review (人工审核入口)
+  - _compute_preselect_set, _generate_review_html, _start_review_server
+  - run_review (人工审核入口，视频路径由调用方通过 video_file 传入)
 """
 
 import json
@@ -11,10 +11,17 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from speech_error_detector.assemble.subtitle_generator import SILENCE_GAP_THRESHOLD
 from speech_error_detector.assemble.assemble import iter_gap_runs
 from speech_error_detector.utils.paths import detect_agent_dir
 from speech_error_detector.server.review_server import ReviewServer
+from speech_error_detector.config import (
+    SILENCE_KEEP_DURATION,
+    SILENCE_GAP_THRESHOLD,
+    TRANSCRIPT_DIR,
+    ANALYSIS_DIR,
+    REVIEW_DIR,
+    WORDS_JSON,
+)
 
 _THIS_DIR = Path(__file__).resolve().parent  # .../speech_error_detector/server
 
@@ -22,15 +29,6 @@ _THIS_DIR = Path(__file__).resolve().parent  # .../speech_error_detector/server
 # ============================================================
 #  Review 辅助函数
 # ============================================================
-
-def _find_video(base_dir: Path) -> Path | None:
-    """在 base_dir 下查找真实视频文件（排除 3_审核 与符号链接）。"""
-    for p in sorted(base_dir.rglob("*.mp4")):
-        if "3_审核" in p.parts or p.is_symlink():
-            continue
-        return p
-    return None
-
 
 def _compute_preselect_set(
     words: list,
@@ -369,12 +367,12 @@ def _start_review_server(
 
 def run_review(
     base_dir: str | Path,
+    video_file: str,
     port: int = 8899,
     host: str = "0.0.0.0",
     autoselect: bool = True,
     silence_gap_threshold: float = SILENCE_GAP_THRESHOLD,
-    silence_keep_duration: float = 0.1,
-    video_file: str | None = None,
+    silence_keep_duration: float = SILENCE_KEEP_DURATION,
     cut_script: str | None = None,
     serve: bool = True,
 ) -> None:
@@ -396,21 +394,21 @@ def run_review(
         port:     审核服务器端口（默认 8899）
         autoselect: 仅自动预选 SILENCE_GAP_THRESHOLD 以上的静音片段
         silence_gap_threshold: 静音自动预选阈值（秒）
-        silence_keep_duration: 删除静音时保留的呼吸感秒数（默认 0.1）
-        video_file: 视频路径（默认自动探测 base_dir 下 .mp4）
+        silence_keep_duration: 删除静音时保留的呼吸感秒数（默认 SILENCE_KEEP_DURATION）
+        video_file: 视频路径（必传，不再自动探测 base_dir）
         cut_script: cut_video.sh 路径
         serve:     True=生成后启动服务器并阻塞；False=仅准备目录
     """
     base_dir = Path(base_dir)
-    analysis_dir = base_dir / "2_分析"
-    review_dir = base_dir / "3_审核"
+    analysis_dir = base_dir / ANALYSIS_DIR
+    review_dir = base_dir / REVIEW_DIR
     # 每次运行前清空旧的审核目录，避免上次 run 残留的 review.html /
     # auto_selected.json / word_categories.json 干扰本轮审核结果
     if review_dir.exists():
         shutil.rmtree(review_dir)
     review_dir.mkdir(parents=True, exist_ok=True)
 
-    words_json = base_dir / "1_转录" / "subtitles_words.json"
+    words_json = base_dir / TRANSCRIPT_DIR / WORDS_JSON
     auto_selected_src = analysis_dir / "auto_selected.json"
 
     print("=" * 60)
@@ -474,10 +472,10 @@ def run_review(
     )
     print(f"  已写入: {report_json.name}（仅报告 {len(report_items)} 项）")
 
-    # --- 视频文件 ---
-    video = Path(video_file) if video_file else _find_video(base_dir)
-    if not video or not video.exists():
-        print("❌ 未找到视频文件，请用 --video 指定。")
+    # --- 视频文件（调用方必须传入，不再自动探测 base_dir）---
+    video = Path(video_file)
+    if not video.exists():
+        print(f"❌ 视频文件不存在: {video}（请通过 video_file 传入正确路径）")
         return
     print(f"  视频: {video}")
 

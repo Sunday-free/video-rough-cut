@@ -21,6 +21,7 @@ from speech_error_detector.detect_repeat.script_window import get_org_script_win
 from speech_error_detector.detect_repeat.script_faithful import filter_repeat_in_org_window
 from speech_error_detector.utils.sentence_io import write_sentences
 from speech_error_detector.utils.paths import detect_repeat_dir
+from speech_error_detector.config import MAX_DET_ROUNDS
 
 
 # ============================================================
@@ -618,7 +619,7 @@ def _validate_judge_decisions(
 # ============================================================
 #  检测主循环
 # ============================================================
-MAX_DET_ROUNDS = 3
+# MAX_DET_ROUNDS 取自 config（与 run_pipeline 默认对齐）
 
 def run_detect_judge_loop(
     *,

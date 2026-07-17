@@ -5,8 +5,8 @@ assemble.py — 步骤5: 装配 auto_selected.json + 口误分析报告
 """
 
 import json
-import os
 from pathlib import Path
+from speech_error_detector.config import VDUR
 from speech_error_detector.utils.paths import detect_repeat_dir, detect_agent_dir
 from speech_error_detector.utils.sentence_io import write_sentences
 
@@ -174,7 +174,7 @@ def run_assemble(
     }
     
     # --- 结尾补尾 ---
-    vdur = video_duration or float(os.environ.get("VDUR", "0"))
+    vdur = video_duration or VDUR
     last = words[-1]
     if vdur and vdur - last["end"] > 0.3:
         words.append({

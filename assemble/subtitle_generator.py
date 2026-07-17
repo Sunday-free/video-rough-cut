@@ -9,13 +9,7 @@ import json
 from pathlib import Path
 
 from speech_error_detector.utils.sentence_io import write_sentences
-
-
-# ============================================================
-#  配置常量
-# ============================================================
-
-SILENCE_GAP_THRESHOLD = 0.5  # 按此阈值切分句子（秒）
+from speech_error_detector.config import WORDS_JSON, SENTENCES_FILE, READABLE_FILE, SILENCE_GAP_THRESHOLD
 
 
 def _sentences_to_records(sentences: list[dict]) -> list[dict]:
@@ -38,7 +32,7 @@ def generate_subtitles_words(volcengine_result: Path, output_dir: Path) -> Path:
       - isGap=True 表示静音段
       - 时间单位为秒
     """
-    result_path = output_dir / "subtitles_words.json"
+    result_path = output_dir / WORDS_JSON
 
     if result_path.exists() and result_path.stat().st_size > 0:
         print(f"   📂 字幕轴缓存存在: {result_path.name}")
@@ -118,7 +112,7 @@ def generate_subtitles_words(volcengine_result: Path, output_dir: Path) -> Path:
 
 def generate_readable_txt(subtitles_words: Path, analysis_dir: Path) -> Path:
     """生成 readable.txt (逐字可读稿，含静音段标记)。"""
-    output = analysis_dir / "readable.txt"
+    output = analysis_dir / READABLE_FILE
     
     with open(subtitles_words, "r") as f:
         words = json.load(f)
@@ -155,7 +149,7 @@ def generate_sentences_by_utterance(
         (sentences_path, sentences_list)
         sentences_list: [{text, startIdx, endIdx}, ...]
     """
-    output = analysis_dir / "sentences.txt"
+    output = analysis_dir / SENTENCES_FILE
 
     # 加载扁平字幕轴
     with open(subtitles_words, "r") as f:
@@ -259,7 +253,7 @@ def generate_sentences_hybrid(
     - 两个不同 utterance 之间 → 强制断句
     - 同一个 utterance 内部 → 遇到 ≥ SILENCE_GAP_THRESHOLD 的静音也断句
     """
-    output = analysis_dir / "sentences.txt"
+    output = analysis_dir / SENTENCES_FILE
 
     with open(subtitles_words, "r") as f:
         words = json.load(f)
@@ -358,7 +352,7 @@ def generate_sentences_hybrid(
 def generate_sentences_txt(
     subtitles_words: Path,
     analysis_dir: Path,
-    split_mode: str = "silence",
+    split_mode: str,
     volcengine_result: Path | None = None,
 ) -> tuple[Path, list]:
     """
@@ -383,7 +377,7 @@ def generate_sentences_txt(
         return generate_sentences_by_utterance(subtitles_words, analysis_dir, volcengine_result)
 
     # === 默认：按静音切分 ===
-    output = analysis_dir / "sentences.txt"
+    output = analysis_dir / SENTENCES_FILE
 
     with open(subtitles_words, "r") as f:
         words = json.load(f)

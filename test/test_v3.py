@@ -21,13 +21,19 @@ V3 = 检测 + 确认两个 Agent，对照原稿找"说错"（仅 resay 残句重
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
 
-from speech_error_detector.ai.chat import DEFAULT_MODEL
+from speech_error_detector.config import (
+    DEFAULT_MODEL,
+    ORIGINAL_SCRIPT_FILE,
+    SENTENCES_FILE,
+    SENTENCES_ORIGIN_FILE,
+    ANALYSIS_DIR,
+    TRANSCRIPT_DIR,
+    WORDS_JSON,
+)
 
 from speech_error_detector.utils.sentence_io import load_sentences, write_sentences
 from speech_error_detector.utils.compare_truth import compare_with_truth
@@ -47,19 +53,19 @@ dirs = [
 ]
 RUN_INDEX = 1   # 当前要跑的目录索引（换数据改这一行；指向 dirs 中对应元素，含其 language）
 BASE = dirs[RUN_INDEX]["dir"]
-DEFAULT_SENTENCES = ROOT / BASE / "2_分析/sentences_origin.txt"
-DEFAULT_WORDS = ROOT / BASE / "1_转录/subtitles_words.json"
-DEFAULT_SCRIPT = ROOT / BASE / "original_script.txt"
+DEFAULT_SENTENCES = ROOT / BASE / ANALYSIS_DIR / SENTENCES_ORIGIN_FILE
+DEFAULT_WORDS = ROOT / BASE / TRANSCRIPT_DIR / WORDS_JSON
+DEFAULT_SCRIPT = ROOT / BASE / ORIGINAL_SCRIPT_FILE
 TEST_DIR = ROOT / "speech_error_detector/test/test_output_review_v3"
 
 
 def _derive_original_script(sentences_path: Path) -> Path | None:
     p = sentences_path
-    if p.parent.name == "2_分析":
-        cand = p.parent.parent / "original_script.txt"
+    if p.parent.name == ANALYSIS_DIR:
+        cand = p.parent.parent / ORIGINAL_SCRIPT_FILE
         if cand.exists():
             return cand
-    for cand in (p.parent / "original_script.txt", p.parent.parent / "original_script.txt"):
+    for cand in (p.parent / ORIGINAL_SCRIPT_FILE, p.parent.parent / ORIGINAL_SCRIPT_FILE):
         if cand.exists():
             return cand
     return None
@@ -231,11 +237,11 @@ def main() -> None:
     # 按 run-index 选择数据目录，输出隔离到独立子目录（避免三份结果互相覆盖）
     idx = args.run_index if args.run_index is not None else RUN_INDEX
     base = dirs[idx]["dir"]
-    sentences_default = ROOT / base / "2_分析/sentences_origin.txt"
-    words_default = ROOT / base / "1_转录/subtitles_words.json"
-    script_default = ROOT / base / "original_script.txt"
+    sentences_default = ROOT / base / ANALYSIS_DIR / SENTENCES_ORIGIN_FILE
+    words_default = ROOT / base / TRANSCRIPT_DIR / WORDS_JSON
+    script_default = ROOT / base / ORIGINAL_SCRIPT_FILE
     analysis_dir = ROOT / "speech_error_detector/test" / f"test_output_review_v3_{idx}_{base}"
-    truth_path = ROOT / base / "sentences.txt"
+    truth_path = ROOT / base / SENTENCES_FILE
 
     args.sentences = args.sentences or str(sentences_default)
     args.words = args.words or str(words_default)

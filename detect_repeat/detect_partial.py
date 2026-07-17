@@ -22,6 +22,7 @@ from pathlib import Path
 
 from speech_error_detector.detect_repeat import CN_DIGIT_MAP, normalize_numerals
 from speech_error_detector.utils.fillers import MODAL_CHARS
+from speech_error_detector.config import PARTIAL_MIN_OVERLAP
 
 
 def _norm(t: str) -> str:
@@ -82,7 +83,7 @@ def _norm_pos_to_orig_pos(norm_pos: int, original: str) -> int:
     return len(original)
 
 
-def detect_partial(sentences: list[dict], words: list | None = None, original_script: str = "") -> list[dict]:
+def detect_partial(sentences: list[dict], original_script: str, words: list | None = None) -> list[dict]:
     """
     执行句间部分删除（保头删尾）检测。
 
@@ -294,7 +295,7 @@ def detect_partial(sentences: list[dict], words: list | None = None, original_sc
                         best_start = start
                     break
 
-        if max_overlap >= 10 and len(a_text) > 0:
+        if max_overlap >= PARTIAL_MIN_OVERLAP and len(a_text) > 0:
             a_head = a_text[:best_start]
             if len(a_head) == 0:
                 continue  # 头部被完全覆盖 → 整句删, 归 inter

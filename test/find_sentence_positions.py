@@ -12,12 +12,9 @@
 """
 
 import os
-import sys
 from pathlib import Path
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
 
 from speech_error_detector.utils.sentence_io import load_sentences
 from speech_error_detector.detect_repeat.script_window import get_org_script_window

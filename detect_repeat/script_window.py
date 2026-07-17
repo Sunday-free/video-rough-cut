@@ -7,6 +7,8 @@ script_window.py — 原文稿窗口匹配与截取
 
 import difflib
 
+from speech_error_detector.config import MIN_RATIO, MIN_SCRIPT_DYN_MAX
+
 
 _PUNCT = set("，。！？、；：\"'（）…— \t\n\r")
 
@@ -30,7 +32,7 @@ def _depunctuate_map(s: str) -> tuple[str, list[int]]:
 def match_script_position(
     script: str,
     text: str,
-    min_ratio: float = 0.4,
+    min_ratio: float = MIN_RATIO,
     expected_pos: float | None = None,
     lower: int | None = None,
     debug: bool = False,
@@ -562,7 +564,7 @@ def get_org_script_window(
         if pick:
             involved.append(pick)
             involve_set.add(pick[0])
-        dyn_max = max(60, max(len(t) for _, t in involved) * 2)
+        dyn_max = max(MIN_SCRIPT_DYN_MAX, max(len(t) for _, t in involved) * 2)
         return _strip_nl(build_org_window(
             script, involved, n_sentences=len(sentences), max_window=dyn_max,
             focus_idx=focus_idx,

@@ -2,12 +2,6 @@
 测试 fragment 多轮检测 - 红姐 30-36
 模拟 detect_loop 中 fragment 的机械检测 + 逐轮应用（无 LLM judge，直接采纳所有 finding）
 """
-import os
-import sys
-
-# 本文件位于 speech_error_detector/test/，需将 output/ 根目录加入 sys.path
-# 以便 `import speech_error_detector.detect.detect_fragment` 可用
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # fmt: off
 SENTENCES = [

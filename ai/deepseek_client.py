@@ -2,51 +2,20 @@
 deepseek_client.py — 通过 OpenAI SDK 调用 DeepSeek Chat Completions API。
 
 替换原来的 Coze 工作流：用更便宜的 DeepSeek 直接做口播粗剪分析。
-API Key 优先级: 环境变量 > .env 文件 > 内置默认值
+API Key / 超时等配置统一从 speech_error_detector.config 加载。
 
 思考模式: 默认 disabled（关闭思考，加速 3-5 倍）。
   文档: https://api-docs.deepseek.com/zh-cn/guides/thinking_mode
   开启: extra_body={"thinking": {"type": "enabled"}}
   关闭: extra_body={"thinking": {"type": "disabled"}}
 """
-import os
-from pathlib import Path
-
 from openai import OpenAI
 
-
-def _load_api_key_from_env() -> str:
-    """加载 DeepSeek API Key：环境变量 > .env 文件"""
-    # 1. 环境变量
-    key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if key:
-        return key
-    
-    # 2. 从 .env 文件加载
-    env_paths = [
-        Path(__file__).resolve().parent / ".env",          # 同目录
-        Path(__file__).resolve().parents[1] / ".env",       # 上级目录
-    ]
-    
-    for env_path in env_paths:
-        if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if (line.startswith("DEEPSEEK_API_KEY=") 
-                    and not line.startswith("#")
-                    and "=" in line):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if key:
-                        return key
-    
-    return ""
+from speech_error_detector.config import DEEPSEEK_API_KEY
 
 
-# API Key：优先环境变量，其次从 .env 文件读取
-DEEPSEEK_API_KEY = _load_api_key_from_env()
-
-# 超时（秒）
-REQUEST_TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "180"))
+# API Key / 超时：统一由 config 加载（环境变量 > .env > 默认值）
+REQUEST_TIMEOUT = 180
 
 # OpenAI 兼容客户端（单例复用连接池）
 _client = None

@@ -15,13 +15,11 @@ test_llm_judge.py — 直接用 detect_judge_data/ 里已拼好的 judge_prompt_
 """
 import json
 import re
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from speech_error_detector.detect_repeat.llm_judge import PROMPTS
-from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
+from speech_error_detector.ai.chat import chat
+from speech_error_detector.config import DEFAULT_MODEL
 from speech_error_detector.ai.llm_parse import parse_json_object, parse_json_array
 
 DEFAULT_DIR = Path(__file__).resolve().parent / "detect_judge_data"

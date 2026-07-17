@@ -16,6 +16,13 @@ from datetime import datetime
 import urllib.request
 import urllib.error
 
+from speech_error_detector.config import (
+    VOLCENGINE_API_KEY,
+    VOLC_MAX_POLL_ATTEMPTS,
+    VOLC_RESULT_JSON,
+    VOLC_ASR_META_JSON,
+)
+
 
 # ============================================================
 #  SSL 配置（解决代理/VPN 环境下的证书问题）
@@ -33,26 +40,6 @@ _ssl_no_verify_ctx.verify_mode = ssl.CERT_NONE
 VOLCENGINE_SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
 VOLCENGINE_QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
 VOLCENGINE_RESOURCE_ID = "volc.seedasr.auc"
-
-
-def get_api_key() -> str:
-    """获取火山引擎 API Key：环境变量 > .env 文件"""
-    key = __import__("os").environ.get("VOLCENGINE_API_KEY", "")
-    if not key:
-        env_paths = [
-            Path(__file__).resolve().parents[2] / ".env",
-            Path("/Users/wangjianmin/Desktop/auto-generate-video/.env"),
-        ]
-        for p in env_paths:
-            if p.exists():
-                for line in p.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("VOLCENGINE_API_KEY=") and not line.startswith("#"):
-                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
-                if key:
-                    break
-    return key
 
 
 # ============================================================
@@ -122,8 +109,8 @@ def transcribe(
         - volcengine_result.json (ASR 原始返回)
         - volcengine_asr_meta.json (元信息: provider/model/attempts/elapsed 等)
     """
-    result_json = output_dir / "volcengine_result.json"
-    meta_json = output_dir / "volcengine_asr_meta.json"
+    result_json = output_dir / VOLC_RESULT_JSON
+    meta_json = output_dir / VOLC_ASR_META_JSON
 
     # 缓存检查
     if result_json.exists() and meta_json.exists():
@@ -133,7 +120,7 @@ def transcribe(
         return result_json, meta
 
     # 获取 API Key
-    api_key = get_api_key()
+    api_key = VOLCENGINE_API_KEY
     if not api_key:
         raise RuntimeError(
             "未找到火山引擎 API Key。\n"
@@ -200,7 +187,7 @@ def transcribe(
 
     # 轮询结果
     query_body = json.dumps({}).encode("utf-8")
-    max_attempts = 180  # 最多等 6 分钟
+    max_attempts = VOLC_MAX_POLL_ATTEMPTS  # 最多等 6 分钟
     start_ms = int(time.time() * 1000)
 
     for attempt in range(1, max_attempts + 1):

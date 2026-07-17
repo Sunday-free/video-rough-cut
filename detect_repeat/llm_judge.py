@@ -9,13 +9,11 @@ llm_judge.py — 步骤4: LLM / Agent 研判层
 """
 
 import json
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
+from speech_error_detector.ai.chat import chat
+from speech_error_detector.config import DEFAULT_MODEL, CONTEXT_RADIUS, LLM_JUDGE_TEMPERATURE
 from speech_error_detector.ai.llm_parse import parse_json_object
 from speech_error_detector.detect_repeat.judge_prompts import (
     PROMPTS,
@@ -40,7 +38,7 @@ def build_judge_prompt(
     detect_results: list[dict],
     sentences: list[dict],
     detector_name: str,
-    context_radius: int = 3,
+    context_radius: int = CONTEXT_RADIUS,
 ) -> str:
     """构建 LLM 研判 Prompt（包含目标句 + 上下文；策略 6 的 finding 自带原文稿窗口）"""
     
@@ -167,7 +165,7 @@ def run_llm_judge(
                 system=system_prompt,
                 user=round_prompts[idx],
                 model=model,
-                temperature=0.1,
+                temperature=LLM_JUDGE_TEMPERATURE,
                 enable_thinking=enable_thinking,
             )
             dec = parse_json_object(response_text)

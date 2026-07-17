@@ -28,7 +28,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
+
+from speech_error_detector.config import TRANSCRIPT_DIR, AUDIO_FILE
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -151,8 +152,8 @@ def execute_ffmpeg_cut(input_path: str, delete_list: list[dict],
 
     # 检测音频偏移量（MP3 编码引入的延迟）
     audio_offset = 0.0
-    for cand in (work_dir.parent / "1_转录" / "audio.mp3",
-                 work_dir / "1_转录" / "audio.mp3"):
+    for cand in (work_dir.parent / TRANSCRIPT_DIR / AUDIO_FILE,
+                 work_dir / TRANSCRIPT_DIR / AUDIO_FILE):
         if cand.exists():
             try:
                 off = subprocess.run(

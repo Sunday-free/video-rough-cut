@@ -25,11 +25,8 @@ test_script_window_position.py — 验证原文稿窗口定位的「位置消歧
 """
 
 import os
-import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
 
 from speech_error_detector.test.test_fragment_pipeline import HONGJIE_SENTENCES
 from speech_error_detector.detect_repeat.script_window import (

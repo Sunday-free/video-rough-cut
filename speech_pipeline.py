@@ -21,14 +21,27 @@ speech_pipeline.py — 口误检测主入口（五层架构）
 
 import json
 import shutil
-import sys
 import time
 from pathlib import Path
 
-# 添加项目根目录
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from speech_error_detector.ai.chat import DEFAULT_MODEL
+from speech_error_detector.config import (
+    DEFAULT_MODEL,
+    DEFAULT_DETECT_REPEAT_MODEL,
+    SILENCE_THRESH,
+    SPLIT_MODE,
+    USE_ORIGINAL_SCRIPT,
+    MAX_DET_ROUNDS,
+    MAX_LOOP_ROUNDS,
+    VIDEO_DURATION,
+    LANGUAGE,
+    TRANSCRIPT_DIR,
+    ANALYSIS_DIR,
+    REVIEW_DIR,
+    WORDS_JSON,
+    VOLC_RESULT_JSON,
+    ORIGINAL_SCRIPT_FILE,
+    SENTENCES_ORIGIN_FILE,
+)
 
 
 from speech_error_detector.detect_repeat.detect_loop import run_detect_judge_loop
@@ -54,7 +67,7 @@ def _find_video(base_dir: Path) -> Path | None:
     """在 base_dir 下查找真实视频文件（排除 3_审核 与符号链接）。"""
     for ext in _VIDEO_EXTS:
         for p in sorted(base_dir.rglob(f"*{ext}")):
-            if "3_审核" in p.parts or p.is_symlink():
+            if REVIEW_DIR in p.parts or p.is_symlink():
                 continue
             return p
     return None
@@ -79,10 +92,10 @@ def transcribe_video(
         language:   识别语言（透传给火山 ASR）
 
     Returns:
-        transcript_dir (Path) = base_dir / "1_转录"
+        transcript_dir (Path) = base_dir / TRANSCRIPT_DIR
     """
     base_dir = Path(base_dir)
-    transcript_dir = base_dir / "1_转录"
+    transcript_dir = base_dir / TRANSCRIPT_DIR
     transcript_dir.mkdir(parents=True, exist_ok=True)
  
     # 1) 定位视频
@@ -116,11 +129,11 @@ def transcribe_video(
 #  步骤0: gen_texts
 # ============================================================
 
-def gen_texts(base_dir: Path, split_mode: str = "silence") -> tuple[Path, Path]:
+def gen_texts(base_dir: Path, split_mode: str) -> tuple[Path, Path]:
     """由 subtitles_words.json 生成 readable.txt 和 sentences.txt（使用 subtitle_generator 模块，含序号合并）"""
-    words_json = base_dir / "1_转录" / "subtitles_words.json"
-    volcengine_result = base_dir / "1_转录" / "volcengine_result.json"
-    analysis_dir = base_dir / "2_分析"
+    words_json = base_dir / TRANSCRIPT_DIR / WORDS_JSON
+    volcengine_result = base_dir / TRANSCRIPT_DIR / VOLC_RESULT_JSON
+    analysis_dir = base_dir / ANALYSIS_DIR
     analysis_dir.mkdir(parents=True, exist_ok=True)
     
     # 调用 subtitle_generator 的函数（含序号合并后处理）
@@ -142,7 +155,7 @@ def gen_texts(base_dir: Path, split_mode: str = "silence") -> tuple[Path, Path]:
 def _prepare_analysis_dir(base_dir: Path, skip_loop: bool = False) -> Path:
     """确保 2_分析 目录及子目录存在。不再删除整个目录（保留 detect 产物供 skip_judge 复用）；
     仅在没有 skip_loop 时清理 loop 子目录，避免旧循环审查文件干扰新结果。"""
-    analysis_dir = base_dir / "2_分析"
+    analysis_dir = base_dir / ANALYSIS_DIR
     analysis_dir.mkdir(parents=True, exist_ok=True)
     make_subdirs(analysis_dir)
     # 非 skip_loop → 清空 loop 子目录（旧循环审查文件会干扰新结果）
@@ -300,18 +313,19 @@ def _generate_updated_sentences_phase(
 
 def run_pipeline(
     base_dir: str | Path,
+    video_path: str | Path,
     skip_judge: bool = False,
     skip_loop: bool = False,
-    silence_thresh: float = 0.3,
-    detect_repeat_model: str = "deepseek-v4-pro",
+    silence_thresh: float = SILENCE_THRESH,
+    detect_repeat_model: str = DEFAULT_DETECT_REPEAT_MODEL,
     detect_agent_model: str = DEFAULT_MODEL,
-    video_duration: float = 0.0,
+    video_duration: float = VIDEO_DURATION,
     enable_deepseek_thinking: bool = False,
-    split_mode: str = "silence",
-    use_original_script: bool = False,
-    max_det_rounds: int = 3,
-    max_loop_rounds: int = 5,
-    language: str = "zh-CN",
+    split_mode: str = SPLIT_MODE,
+    use_original_script: bool = USE_ORIGINAL_SCRIPT,
+    max_det_rounds: int = MAX_DET_ROUNDS,
+    max_loop_rounds: int = MAX_LOOP_ROUNDS,
+    language: str = LANGUAGE,
 ) -> dict:
     """
     运行完整的口误检测流水线（编排各步骤子函数）。
@@ -331,6 +345,7 @@ def run_pipeline(
         detect_agent_model:  Agent 循环审查(V3) 所用模型，默认 DEFAULT_MODEL
         video_duration: 视频时长(秒)，用于结尾补尾
         enable_deepseek_thinking: 开启 DeepSeek 思考模式
+        video_path: 视频文件路径
 
     Returns:
         汇总统计字典
@@ -339,12 +354,12 @@ def run_pipeline(
     analysis_dir = _prepare_analysis_dir(base_dir, skip_loop=skip_loop)
 
     # 预检：转录目录（1_转录）不存在才调用火山转录（提取音频→火山识别→1_转录）
-    transcript_dir = base_dir / "1_转录"
+    transcript_dir = base_dir / TRANSCRIPT_DIR
     if not transcript_dir.exists():
         print("=" * 60)
         print("  [预检] 未发现 1_转录 目录，自动从视频转录...")
         print("=" * 60)
-        _vid = _find_video(base_dir)
+        _vid = Path(video_path)
         transcribe_video(base_dir, video_file=_vid, language=language)
         if video_duration == 0.0 and _vid and _vid.exists():
             try:
@@ -353,10 +368,10 @@ def run_pipeline(
             except Exception:
                 pass
 
-    words_json = base_dir / "1_转录" / "subtitles_words.json"
+    words_json = base_dir / TRANSCRIPT_DIR / WORDS_JSON
     # 原稿放在项目根目录下
-    original_script_path = base_dir / "original_script.txt"
-    transcript_dir = base_dir / "1_转录"
+    original_script_path = base_dir / ORIGINAL_SCRIPT_FILE
+    transcript_dir = base_dir / TRANSCRIPT_DIR
 
     t_start = time.time()
 
@@ -383,7 +398,7 @@ def run_pipeline(
 
     # ========== 备份最原始句子（detect 之前） ==========
     # 存一份未做任何检测清洗的 sentences_origin.txt，便于后续对照/回溯
-    sentences_origin_path = analysis_dir / "sentences_origin.txt"
+    sentences_origin_path = analysis_dir / SENTENCES_ORIGIN_FILE
     write_sentences(sentences_origin_path, sentences)
     print(f"  已备份原始句子: {sentences_origin_path.name} ({len(sentences)} 句)")
 

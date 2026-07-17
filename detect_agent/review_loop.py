@@ -18,14 +18,12 @@ V3 检测/确认专门对照原稿找"说错"（仅 resay：
 """
 
 import json
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from speech_error_detector.ai.chat import chat, DEFAULT_MODEL
+from speech_error_detector.ai.chat import chat
+from speech_error_detector.config import DEFAULT_MODEL, CONTEXT_RADIUS, AGENT_MAX_ROUNDS, DEFAULT_TEMPERATURE
 from speech_error_detector.ai.llm_parse import parse_json_object
 
 # 通用工具（V3 的 detect/apply 依赖），来自同包 agent_apply：
@@ -43,7 +41,6 @@ from speech_error_detector.detect_agent.prompts import (
     build_confirm_v3_prompt,
 )
 
-MAX_ROUNDS = 5          # 最大循环轮次，防止无限循环
 CONSECUTIVE_EMPTY_TO_EXIT = 2  # 连续N轮无新问题才退出
 DETECT_MAX_RETRY = 3     # 单轮 Detect LLM 硬失败（抛异常）时的重试次数
 DETECT_RETRY_BACKOFF = 2.0  # 重试退避基数（秒），第 n 次重试等待 n * backoff
@@ -108,7 +105,7 @@ def _run_detect(
                 system=DETECT_V3_SYSTEM_PROMPT,
                 user=detect_prompt,
                 model=model,
-                temperature=0.0,
+                temperature=DEFAULT_TEMPERATURE,
                 enable_thinking=enable_thinking,
             )
             break
@@ -182,7 +179,7 @@ def _run_verify(
             }
             continue
         prompt_parts.append(
-            build_confirm_v3_prompt(iss, current_sentences, effective_script, context_radius=3)
+            build_confirm_v3_prompt(iss, current_sentences, effective_script, context_radius=CONTEXT_RADIUS)
         )
         valid_orig_idx.append(i)
     results: dict[int, dict] = {}
@@ -194,7 +191,7 @@ def _run_verify(
                 system=CONFIRM_V3_SYSTEM_PROMPT,
                 user=prompt,
                 model=model,
-                temperature=0.0,
+                temperature=DEFAULT_TEMPERATURE,
                 enable_thinking=enable_thinking,
             )
             dec = parse_json_object(resp)
@@ -515,11 +512,11 @@ def run_agent_review_loop_v3(
     loop_dir: Path,
     sentences: list[dict],
     words: list[dict],
+    original_script: str,
     model: str = DEFAULT_MODEL,
-    max_rounds: int = MAX_ROUNDS,
+    max_rounds: int = AGENT_MAX_ROUNDS,
     consecutive_empty_to_exit: int = CONSECUTIVE_EMPTY_TO_EXIT,
     use_original_script: bool = False,
-    original_script: str = "",
     enable_thinking: bool = False,
 ) -> tuple[Path, list[dict], list[dict]]:
     """运行 V3 读稿错误检测循环（检测→确认→应用）。

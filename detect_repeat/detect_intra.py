@@ -9,6 +9,7 @@ detect_intra.py — 句内重复机械检测
 from pathlib import Path
 
 from speech_error_detector.utils.fillers import MODAL_CHARS
+from speech_error_detector.config import INTRA_MAX_GAP_DIGIT, INTRA_MAX_GAP_OTHER
 
 # 自然并列重复的连接性虚词：两个重复单元之间仅隔这些字（1~3 个）时，
 # 视为汉语正常的并列强调（如"一波还有一波""一个又一个""一遍又一遍"），不算口误。
@@ -272,7 +273,7 @@ def detect_intra(sentences: list[dict], original_script: str = "") -> list[dict]
                 j = txt.find(sub, i + length)  # 在后面查找相同子串
                 # 距离阈值：纯数字子串放宽到 8 字符（数字远距离重复几乎都是口误重说，
                 # 如"8000股全部卖掉8000"），其余仍为 <= 3 字符。
-                max_gap = 8 if all(_is_digit_char(ch) for ch in sub) else 3
+                max_gap = INTRA_MAX_GAP_DIGIT if all(_is_digit_char(ch) for ch in sub) else INTRA_MAX_GAP_OTHER
                 if j != -1 and (j - (i + length)) <= max_gap:
                     # 自然叠词 / 并列重复（如"一波一波""一波还有一波""寻思寻思"）
                     # 是正常口语，不是口误，跳过。
